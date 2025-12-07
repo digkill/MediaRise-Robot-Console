@@ -1,0 +1,249 @@
+{
+  "_type": "export",
+  "__export_format": 4,
+  "__export_date": "2024-01-01T00:00:00.000Z",
+  "__export_source": "insomnia.desktop.app:v2023.5.8",
+  "resources": [
+    {
+      "_id": "wrk_mediarise",
+      "_type": "workspace",
+      "name": "MediaRise Robot Console API",
+      "description": "API для тестирования MediaRise Robot Console Backend",
+      "parentId": null
+    },
+    {
+      "_id": "env_base",
+      "_type": "environment",
+      "parentId": "wrk_mediarise",
+      "name": "Base Environment",
+      "data": {
+        "base_url": "http://localhost:8080",
+        "device_id": "test-device-123",
+        "client_id": "test-client-456",
+        "serial_number": "SN123456789",
+        "firmware_version": "1.0.0",
+        "jwt_secret": "YBFGDE-IDBW&NDCG45zgvrfdrddxg7sdsDEw",
+        "hmac_key": "FCDEfd3_fde3d3fcelcvmfdjk646cfe32"
+      },
+      "dataPropertyOrder": {
+        "&": [
+          "base_url",
+          "device_id",
+          "client_id",
+          "serial_number",
+          "firmware_version",
+          "jwt_secret",
+          "hmac_key"
+        ]
+      },
+      "color": null,
+      "isPrivate": false,
+      "metaSortKey": 1000000000000
+    },
+    {
+      "_id": "fld_ota",
+      "_type": "request_group",
+      "parentId": "wrk_mediarise",
+      "name": "OTA Endpoints",
+      "description": "OTA (Over-The-Air) endpoints для обновления прошивки устройств",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 1000000000000,
+      "color": "#7d69cb"
+    },
+    {
+      "_id": "req_ota_check",
+      "_type": "request",
+      "parentId": "fld_ota",
+      "name": "Check Version",
+      "description": "Проверка версии прошивки и получение информации о доступных обновлениях",
+      "url": "{{ base_url }}/ota/",
+      "method": "POST",
+      "body": {
+        "mimeType": "application/json",
+        "text": "{\n  \"serial_number\": \"{{ serial_number }}\",\n  \"firmware_version\": \"{{ firmware_version }}\",\n  \"client_id\": \"{{ client_id }}\"\n}"
+      },
+      "parameters": [],
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json",
+          "id": "pair_content_type"
+        }
+      ],
+      "authentication": {},
+      "metaSortKey": 1000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global"
+    },
+    {
+      "_id": "req_ota_activate",
+      "_type": "request",
+      "parentId": "fld_ota",
+      "name": "Activate Device",
+      "description": "Активация устройства. Требует вычисления HMAC для challenge.",
+      "url": "{{ base_url }}/ota/activate",
+      "method": "POST",
+      "body": {
+        "mimeType": "application/json",
+        "text": "{\n  \"serial_number\": \"{{ serial_number }}\",\n  \"challenge\": \"test-challenge-123\",\n  \"response\": \"computed-hmac-response\"\n}"
+      },
+      "parameters": [],
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json",
+          "id": "pair_content_type"
+        }
+      ],
+      "authentication": {},
+      "metaSortKey": 2000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global"
+    },
+    {
+      "_id": "fld_assets",
+      "_type": "request_group",
+      "parentId": "wrk_mediarise",
+      "name": "Assets Endpoints",
+      "description": "Endpoints для загрузки ресурсов (assets) для устройств",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 2000000000000,
+      "color": "#1c7c54"
+    },
+    {
+      "_id": "req_assets_download",
+      "_type": "request",
+      "parentId": "fld_assets",
+      "name": "Download Assets",
+      "description": "Загрузка ресурсов для указанной версии",
+      "url": "{{ base_url }}/assets/{{ firmware_version }}",
+      "method": "GET",
+      "body": {},
+      "parameters": [],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 1000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global"
+    },
+    {
+      "_id": "fld_upload",
+      "_type": "request_group",
+      "parentId": "wrk_mediarise",
+      "name": "Upload Endpoints",
+      "description": "Endpoints для загрузки файлов (скриншоты и т.д.)",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 3000000000000,
+      "color": "#d9534f"
+    },
+    {
+      "_id": "req_upload_screenshot",
+      "_type": "request",
+      "parentId": "fld_upload",
+      "name": "Upload Screenshot",
+      "description": "Загрузка скриншота экрана устройства",
+      "url": "{{ base_url }}/upload/screenshot",
+      "method": "POST",
+      "body": {
+        "mimeType": "multipart/form-data",
+        "params": [
+          {
+            "id": "pair_file",
+            "name": "file",
+            "type": "file",
+            "value": "",
+            "fileName": ""
+          },
+          {
+            "id": "pair_device_id",
+            "name": "device_id",
+            "type": "text",
+            "value": "{{ device_id }}"
+          }
+        ]
+      },
+      "parameters": [],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 1000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global"
+    },
+    {
+      "_id": "req_health",
+      "_type": "request",
+      "parentId": "wrk_mediarise",
+      "name": "Health Check",
+      "description": "Health check endpoint для проверки работоспособности сервера",
+      "url": "{{ base_url }}/health",
+      "method": "GET",
+      "body": {},
+      "parameters": [],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 4000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global"
+    },
+    {
+      "_id": "fld_websocket",
+      "_type": "request_group",
+      "parentId": "wrk_mediarise",
+      "name": "WebSocket (Голос/Аудио)",
+      "description": "⚠️ Insomnia не поддерживает WebSocket напрямую. Используйте websocket_test.html или другие инструменты. Endpoint: ws://{{ base_url }}/ws",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 5000000000000,
+      "color": "#ff9800"
+    },
+    {
+      "_id": "req_websocket_info",
+      "_type": "request",
+      "parentId": "fld_websocket",
+      "name": "WebSocket Info (README)",
+      "description": "WebSocket endpoint для отправки голоса и получения ответа:\n\nEndpoint: ws://{{ base_url }}/ws\n\nПротокол:\n1. Подключиться к WebSocket\n2. Отправить hello сообщение (JSON)\n3. Отправить аудио (бинарные данные Opus)\n4. Получить транскрипцию (stt сообщение)\n5. Получить ответ LLM (llm сообщение)\n6. Получить аудио ответ (бинарные данные Opus)\n\nДля тестирования используйте:\n- websocket_test.html (откройте в браузере)\n- wscat: wscat -c ws://localhost:8080/ws\n- Python скрипт (см. docs/ROBOT_WEBSOCKET.md)\n\nСм. подробную документацию в docs/ROBOT_WEBSOCKET.md",
+      "url": "{{ base_url }}/ws",
+      "method": "GET",
+      "body": {},
+      "parameters": [],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 1000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global"
+    }
+  ]
+}

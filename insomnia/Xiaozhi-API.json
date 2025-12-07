@@ -1,0 +1,230 @@
+{
+  "_type": "export",
+  "__export_format": 4,
+  "__export_date": "2024-01-01T00:00:00.000Z",
+  "__export_source": "insomnia.desktop.app:v2023.5.8",
+  "resources": [
+    {
+      "_id": "env_base",
+      "_type": "environment",
+      "color": null,
+      "data": {
+        "base_url": "http://localhost:8080",
+        "device_id": "test-device-123",
+        "client_id": "test-client-456",
+        "serial_number": "SN123456789",
+        "firmware_version": "1.0.0",
+        "jwt_secret": "YBFGDE-IDBW&NDCG45zgvrfdrddxg7sdsDEw",
+        "hmac_key": "FCDEfd3_fde3d3fcelcvmfdjk646cfe32"
+      },
+      "dataPropertyOrder": {
+        "&": [
+          "base_url",
+          "device_id",
+          "client_id",
+          "serial_number",
+          "firmware_version",
+          "jwt_secret",
+          "hmac_key"
+        ]
+      },
+      "isPrivate": false,
+      "name": "Base Environment",
+      "parentId": null
+    },
+    {
+      "_id": "fld_ota",
+      "_type": "request_group",
+      "children": [
+        "req_ota_check",
+        "req_ota_activate"
+      ],
+      "color": "#7d69cb",
+      "description": "OTA (Over-The-Air) endpoints для обновления прошивки устройств",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 1000000000000,
+      "name": "OTA Endpoints",
+      "parentId": null
+    },
+    {
+      "_id": "req_ota_check",
+      "_type": "request",
+      "authentication": {},
+      "body": {
+        "mimeType": "application/json",
+        "text": "{\n  \"serial_number\": \"{{ serial_number }}\",\n  \"firmware_version\": \"{{ firmware_version }}\",\n  \"client_id\": \"{{ client_id }}\"\n}"
+      },
+      "created": 1704067200000,
+      "description": "Проверка версии прошивки и получение информации о доступных обновлениях",
+      "headers": [
+        {
+          "id": "pair_content_type",
+          "name": "Content-Type",
+          "value": "application/json"
+        }
+      ],
+      "isPrivate": false,
+      "metaSortKey": 1000000000000,
+      "method": "POST",
+      "name": "Check Version",
+      "parameters": [],
+      "parentId": "fld_ota",
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingFollowRedirects": "global",
+      "settingRebuildPath": true,
+      "settingSendCookies": true,
+      "url": "{{ base_url }}/ota/"
+    },
+    {
+      "_id": "req_ota_activate",
+      "_type": "request",
+      "authentication": {},
+      "body": {
+        "mimeType": "application/json",
+        "text": "{\n  \"serial_number\": \"{{ serial_number }}\",\n  \"challenge\": \"test-challenge-123\",\n  \"response\": \"computed-hmac-response\"\n}"
+      },
+      "created": 1704067200000,
+      "description": "Активация устройства. Требует вычисления HMAC для challenge.",
+      "headers": [
+        {
+          "id": "pair_content_type",
+          "name": "Content-Type",
+          "value": "application/json"
+        }
+      ],
+      "isPrivate": false,
+      "metaSortKey": 2000000000000,
+      "method": "POST",
+      "name": "Activate Device",
+      "parameters": [],
+      "parentId": "fld_ota",
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingFollowRedirects": "global",
+      "settingRebuildPath": true,
+      "settingSendCookies": true,
+      "url": "{{ base_url }}/ota/activate",
+      "_type": "export",
+      "__export_format": 4,
+      "__export_date": "2024-01-01T00:00:00.000Z",
+      "__export_source": "insomnia.desktop.app:v2023.5.8"
+    },
+    {
+      "_id": "fld_assets",
+      "_type": "request_group",
+      "children": [
+        "req_assets_download"
+      ],
+      "color": "#1c7c54",
+      "description": "Endpoints для загрузки ресурсов (assets) для устройств",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 2000000000000,
+      "name": "Assets Endpoints",
+      "parentId": null
+    },
+    {
+      "_id": "req_assets_download",
+      "_type": "request",
+      "authentication": {},
+      "body": {},
+      "created": 1704067200000,
+      "description": "Загрузка ресурсов для указанной версии",
+      "headers": [],
+      "isPrivate": false,
+      "metaSortKey": 1000000000000,
+      "method": "GET",
+      "name": "Download Assets",
+      "parameters": [],
+      "parentId": "fld_assets",
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingFollowRedirects": "global",
+      "settingRebuildPath": true,
+      "settingSendCookies": true,
+      "url": "{{ base_url }}/assets/{{ firmware_version }}",
+      "_type": "export",
+      "__export_format": 4,
+      "__export_date": "2024-01-01T00:00:00.000Z",
+      "__export_source": "insomnia.desktop.app:v2023.5.8"
+    },
+    {
+      "_id": "fld_upload",
+      "_type": "request_group",
+      "children": [
+        "req_upload_screenshot"
+      ],
+      "color": "#d9534f",
+      "description": "Endpoints для загрузки файлов (скриншоты и т.д.)",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 3000000000000,
+      "name": "Upload Endpoints",
+      "parentId": null
+    },
+    {
+      "_id": "req_upload_screenshot",
+      "_type": "request",
+      "authentication": {},
+      "body": {
+        "mimeType": "multipart/form-data",
+        "params": [
+          {
+            "id": "pair_file",
+            "name": "file",
+            "type": "file",
+            "value": "",
+            "fileName": ""
+          }
+        ]
+      },
+      "created": 1704067200000,
+      "description": "Загрузка скриншота экрана устройства",
+      "headers": [],
+      "isPrivate": false,
+      "metaSortKey": 1000000000000,
+      "method": "POST",
+      "name": "Upload Screenshot",
+      "parameters": [],
+      "parentId": "fld_upload",
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingFollowRedirects": "global",
+      "settingRebuildPath": true,
+      "settingSendCookies": true,
+      "url": "{{ base_url }}/upload/screenshot",
+      "_type": "export",
+      "__export_format": 4,
+      "__export_date": "2024-01-01T00:00:00:00.000Z",
+      "__export_source": "insomnia.desktop.app:v2023.5.8"
+    },
+    {
+      "_id": "req_health",
+      "_type": "request",
+      "authentication": {},
+      "body": {},
+      "created": 1704067200000,
+      "description": "Health check endpoint для проверки работоспособности сервера",
+      "headers": [],
+      "isPrivate": false,
+      "metaSortKey": 4000000000000,
+      "method": "GET",
+      "name": "Health Check",
+      "parameters": [],
+      "parentId": null,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingFollowRedirects": "global",
+      "settingRebuildPath": true,
+      "settingSendCookies": true,
+      "url": "{{ base_url }}/health",
+      "_type": "export",
+      "__export_format": 4,
+      "__export_date": "2024-01-01T00:00:00.000Z",
+      "__export_source": "insomnia.desktop.app:v2023.5.8"
+    }
+  ]
+}
+

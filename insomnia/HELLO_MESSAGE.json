@@ -1,0 +1,17 @@
+{
+  "type": "hello",
+  "version": 3,
+  "transport": "websocket",
+  "features": {
+    "aec": true,
+    "mcp": false
+  },
+  "audio_params": {
+    "format": "opus",
+    "sample_rate": 48000,
+    "channels": 1,
+    "frame_duration": 20
+  },
+  "session_id": null
+}
+
