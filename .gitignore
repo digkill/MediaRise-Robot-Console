@@ -26,3 +26,6 @@ storage/
 .DS_Store
 Thumbs.db
 
+# Notes with secrets
+Notes.md
+
