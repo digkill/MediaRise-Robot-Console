@@ -1,66 +1,156 @@
 //! Конфигурация сервера
+//!
+//! Этот модуль отвечает за загрузку и хранение всех настроек приложения.
+//! Настройки загружаются из переменных окружения или .env файла.
+//! Все конфигурационные структуры можно сериализовать в JSON и обратно.
 
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+// Импортируем нужные типы и трейты
+use serde::{Deserialize, Serialize};  // Трейты для сериализации/десериализации (JSON, YAML и т.д.)
+use std::path::PathBuf;  // Тип для работы с путями к файлам (кроссплатформенно)
 
+// Константа - базовый URL для OpenAI API
+// Это стандартный адрес, который используется по умолчанию для STT и TTS
 const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 
+/// Главная структура конфигурации приложения
+/// 
+/// Содержит все настройки для работы сервера:
+/// - server: настройки HTTP/WebSocket сервера (адрес, порт)
+/// - database: настройки подключения к базе данных
+/// - grok: настройки для работы с Grok AI (xAI API)
+/// - stt: настройки для распознавания речи (Speech-to-Text)
+/// - tts: настройки для синтеза речи (Text-to-Speech)
+/// - storage: пути к директориям для хранения файлов
+/// - security: секретные ключи для JWT и HMAC
+/// - mqtt: опциональные настройки MQTT (только если включена фича)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Настройки HTTP и WebSocket сервера
     pub server: ServerConfig,
+    /// Настройки подключения к базе данных (SQLite, PostgreSQL, MySQL)
     pub database: DatabaseConfig,
+    /// Настройки для работы с Grok AI (языковая модель от xAI)
     pub grok: GrokConfig,
+    /// Настройки для распознавания речи (STT - Speech-to-Text)
     pub stt: SttConfig,
+    /// Настройки для синтеза речи (TTS - Text-to-Speech)
     pub tts: TtsConfig,
+    /// Настройки путей для хранения файлов (прошивки, ассеты, загрузки)
     pub storage: StorageConfig,
+    /// Секретные ключи для безопасности (JWT токены, HMAC подписи)
     pub security: SecurityConfig,
+    /// Опциональные настройки MQTT (только если включена фича "mqtt")
+    /// Option означает, что это поле может быть None (отсутствовать)
     #[cfg(feature = "mqtt")]
     pub mqtt: Option<MqttConfig>,
 }
 
+/// Настройки HTTP и WebSocket сервера
+/// 
+/// Определяет на каком адресе и порту будет работать сервер.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// IP адрес или hostname для прослушивания
+    /// "0.0.0.0" означает слушать на всех сетевых интерфейсах
+    /// "127.0.0.1" или "localhost" означает только локальные подключения
     pub host: String,
+    /// Порт для HTTP запросов (обычно 8080)
     pub port: u16,
+    /// Порт для WebSocket соединений (обычно тот же, что и HTTP)
     pub websocket_port: u16,
 }
 
+/// Настройки подключения к базе данных
+/// 
+/// URL базы данных в формате:
+/// - SQLite: "sqlite:./database.db"
+/// - PostgreSQL: "postgresql://user:password@localhost/dbname"
+/// - MySQL: "mysql://user:password@localhost/dbname"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
+    /// Строка подключения к базе данных (connection string)
     pub url: String,
 }
 
+/// Настройки для работы с Grok AI (xAI API)
+/// 
+/// Grok - это языковая модель от xAI, которая используется для генерации ответов.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrokConfig {
+    /// API ключ для доступа к xAI API
+    /// Получить можно на https://x.ai
     pub api_key: String,
+    /// URL API сервера xAI (обычно "https://api.x.ai/v1")
     pub api_url: String,
+    /// Название модели Grok (например, "grok-beta", "grok-2", "grok-4")
     pub model: String,
+    /// Максимальное количество токенов в ответе
+    /// Токен - это примерно одно слово или часть слова
+    /// Больше токенов = более длинный ответ, но дороже
     pub max_tokens: u32,
+    /// Температура генерации (0.0 - 2.0)
+    /// 0.0 = детерминированные ответы (всегда одинаковые)
+    /// 1.0 = креативные ответы (разные каждый раз)
+    /// 2.0 = очень креативные (может быть бессмыслица)
     pub temperature: f32,
+    /// Системный промпт - инструкции для AI о том, как себя вести
+    /// Например: "You are a helpful assistant" или "You are Miko, a friendly robot"
+    /// Option<String> означает, что это поле может быть None (не задано)
     pub system_prompt: Option<String>,
 }
 
+/// Настройки для распознавания речи (STT - Speech-to-Text)
+/// 
+/// STT преобразует аудио в текст. Например, когда пользователь говорит,
+/// STT распознает что он сказал и возвращает текст.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SttConfig {
+    /// Провайдер STT сервиса (например, "whisper", "openai")
+    /// "whisper" и "openai" - это одно и то же (OpenAI Whisper API)
     pub provider: String,
+    /// URL API для STT (обычно "https://api.openai.com/v1")
+    /// Option означает, что если не задано, будет использован дефолтный
     pub api_url: Option<String>,
+    /// API ключ для доступа к STT сервису
+    /// Получить можно на https://platform.openai.com
     pub api_key: Option<String>,
 }
 
+/// Формат аудио для TTS ответов
+/// 
+/// Enum (перечисление) - это тип, который может быть одним из нескольких вариантов.
+/// В данном случае аудио может быть либо в формате Opus, либо MP3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AudioFormat {
-    #[serde(rename = "opus")]
+    /// Opus - современный аудио кодек с хорошим сжатием
+    /// Хорошо подходит для голосовых сообщений, меньше размер файла
+    /// Но требует декодирования на клиенте (браузер может не поддерживать напрямую)
+    #[serde(rename = "opus")]  // При сериализации в JSON будет строка "opus"
     Opus,
-    #[serde(rename = "mp3")]
+    /// MP3 - старый, но широко поддерживаемый формат
+    /// Браузеры поддерживают MP3 напрямую, не нужен декодер
+    /// Но файлы обычно больше по размеру
+    #[serde(rename = "mp3")]  // При сериализации в JSON будет строка "mp3"
     Mp3,
 }
 
+/// Настройки для синтеза речи (TTS - Text-to-Speech)
+/// 
+/// TTS преобразует текст в аудио. Например, когда AI генерирует ответ,
+/// TTS превращает этот текст в речь, которую можно проиграть.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsConfig {
+    /// Провайдер TTS сервиса (например, "openai")
     pub provider: String,
+    /// URL API для TTS (обычно "https://api.openai.com/v1")
     pub api_url: Option<String>,
+    /// API ключ для доступа к TTS сервису
     pub api_key: Option<String>,
+    /// Голос для синтеза речи
+    /// OpenAI поддерживает: "alloy", "echo", "fable", "onyx", "nova", "shimmer"
+    /// Каждый голос звучит по-разному
     pub voice: String,
+    /// Формат аудио для ответов (Opus или MP3)
     pub audio_format: AudioFormat,
 }
 
@@ -87,15 +177,32 @@ pub struct MqttConfig {
 }
 
 impl Config {
+    /// Загружает конфигурацию из переменных окружения
+    /// 
+    /// Этот метод:
+    /// 1. Пытается загрузить .env файл (если есть)
+    /// 2. Читает переменные окружения
+    /// 3. Создает объект Config с настройками по умолчанию
+    /// 4. Перезаписывает дефолтные значения значениями из переменных окружения
+    /// 
+    /// Возвращает Result<Config> - либо успешно загруженную конфигурацию,
+    /// либо ошибку (но в данном случае ошибок быть не должно, т.к. есть дефолты)
     pub fn load() -> anyhow::Result<Self> {
-        // Load from environment variables
-        // Пытаемся загрузить .env файл, но если есть ошибки парсинга - загружаем вручную
+        // ============================================
+        // ШАГ 1: Загрузка .env файла
+        // ============================================
+        // .env файл - это текстовый файл с переменными окружения в формате KEY=VALUE
+        // Обычно находится в корне проекта и содержит секретные ключи (API ключи и т.д.)
+        // dotenv::dotenv() пытается загрузить этот файл и установить переменные окружения
+        
         match dotenv::dotenv() {
+            // Успешно загружен - выводим путь к файлу
             Ok(path) => {
                 tracing::info!("Loaded .env file from: {:?}", path);
             }
+            // Файл не найден - это нормально, не критическая ошибка
+            // Просто будем использовать переменные окружения, которые уже установлены в системе
             Err(dotenv::Error::Io(_)) => {
-                // Файл не найден - это нормально, используем переменные окружения
                 tracing::debug!(".env file not found, using environment variables");
             }
             Err(dotenv::Error::LineParse(problem_line, _err)) => {

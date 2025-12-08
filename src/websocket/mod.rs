@@ -277,13 +277,60 @@ pub async fn handle_connection(
                     match processor.process_incoming_audio(&data) {
                         Ok(pcm_samples) => {
                             info!("Decoded audio to PCM: {} samples", pcm_samples.len());
-                            // Отправляем на STT
-                            if let Err(e) =
-                                handle_audio_data(&services, &session_id, &pcm_samples, &mut sender)
+                            
+                            // Получаем параметры сессии для определения sample_rate
+                            let session = SESSION_MANAGER.get_session(&session_id).await;
+                            let sample_rate = session
+                                .as_ref()
+                                .map(|s| s.audio_params.sample_rate)
+                                .unwrap_or(48000); // Дефолт 48kHz
+                            
+                            // Добавляем samples в буфер и проверяем, готов ли он к отправке
+                            let is_ready = SESSION_MANAGER
+                                .add_audio_samples(&session_id, &pcm_samples, sample_rate)
+                                .await;
+                            
+                            let buffer_duration = SESSION_MANAGER
+                                .get_audio_buffer_duration(&session_id)
+                                .await;
+                            
+                            info!(
+                                "Audio buffer: added {} samples, total: {:.2} seconds, ready: {}",
+                                pcm_samples.len(),
+                                buffer_duration,
+                                is_ready
+                            );
+                            
+                            // Если буфер готов (накоплено >= 0.5 секунды), отправляем в STT
+                            if is_ready {
+                                if let Some(accumulated_samples) = SESSION_MANAGER
+                                    .take_audio_samples(&session_id)
                                     .await
-                            {
-                                error!("Failed to handle audio: {}", e);
-                                error!("Audio handling error details: {:?}", e);
+                                {
+                                    info!(
+                                        "Buffer ready! Sending {} samples ({:.2} seconds) to STT",
+                                        accumulated_samples.len(),
+                                        accumulated_samples.len() as f32 / sample_rate as f32
+                                    );
+                                    
+                                    if let Err(e) = handle_audio_data(
+                                        &services,
+                                        &session_id,
+                                        &accumulated_samples,
+                                        &mut sender,
+                                    )
+                                    .await
+                                    {
+                                        error!("Failed to handle audio: {}", e);
+                                        error!("Audio handling error details: {:?}", e);
+                                    }
+                                }
+                            } else {
+                                // Буфер еще не готов - просто накапливаем
+                                info!(
+                                    "Buffer not ready yet: {:.2} seconds (need >= 0.5 seconds)",
+                                    buffer_duration
+                                );
                             }
                         }
                         Err(e) => {
@@ -349,6 +396,32 @@ pub async fn handle_connection(
             }
             Ok(WsMessage::Close(_)) => {
                 info!("WebSocket connection closed");
+                
+                // Перед закрытием отправляем оставшиеся данные из буфера (если есть)
+                // Даже если меньше 0.5 секунды, попробуем отправить (может быть последние слова)
+                if let Some(remaining_samples) = SESSION_MANAGER
+                    .take_audio_samples_force(&session_id, true)
+                    .await
+                {
+                    if !remaining_samples.is_empty() {
+                        info!(
+                            "Sending remaining {} samples from buffer before closing",
+                            remaining_samples.len()
+                        );
+                        // Пытаемся отправить, но не обрабатываем ошибки (соединение уже закрывается)
+                        let _ = handle_audio_data(
+                            &services,
+                            &session_id,
+                            &remaining_samples,
+                            &mut sender,
+                        )
+                        .await;
+                    }
+                }
+                
+                // Очищаем буфер при закрытии соединения
+                SESSION_MANAGER.clear_audio_buffer(&session_id).await;
+                
                 break;
             }
             Err(e) => {
@@ -448,12 +521,18 @@ async fn handle_listen_text(
         Ok(_) => {
             info!("TTS audio sent successfully");
             if let Err(e) = sender.flush().await {
-                error!("Failed to flush WebSocket after TTS audio: {}", e);
+                warn!("Failed to flush WebSocket after TTS audio (connection may be closed): {}", e);
             }
         }
         Err(e) => {
-            error!("Failed to send TTS audio: {}", e);
-            return Err(anyhow::anyhow!("Failed to send TTS audio: {}", e));
+            let error_msg = format!("{}", e);
+            if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
+                warn!("Client closed connection before TTS audio could be sent. This is normal if client disconnected.");
+                // Это нормально, если клиент отключился - просто логируем
+            } else {
+                error!("Failed to send TTS audio: {}", e);
+                return Err(anyhow::anyhow!("Failed to send TTS audio: {}", e));
+            }
         }
     }
 
@@ -482,12 +561,22 @@ async fn handle_stt_message(
         Ok(_) => {
             info!("STT message sent successfully");
             if let Err(e) = sender.flush().await {
-                error!("Failed to flush WebSocket after STT message: {}", e);
+                // Если flush не удался, это может означать, что соединение закрыто
+                // Но это не критично - сообщение уже отправлено
+                warn!("Failed to flush WebSocket after STT message (connection may be closed): {}", e);
             }
         }
         Err(e) => {
-            error!("Failed to send STT message: {}", e);
-            return Err(anyhow::anyhow!("Failed to send STT message: {}", e));
+            // Если соединение закрыто клиентом, просто логируем и продолжаем
+            // Не прерываем обработку, так как LLM и TTS могут быть полезны для других клиентов
+            let error_msg = format!("{}", e);
+            if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
+                warn!("Client closed connection before STT message could be sent. Continuing processing anyway.");
+                // Продолжаем обработку, но не отправляем сообщения клиенту
+            } else {
+                error!("Failed to send STT message: {}", e);
+                return Err(anyhow::anyhow!("Failed to send STT message: {}", e));
+            }
         }
     }
 
@@ -530,12 +619,18 @@ async fn handle_stt_message(
             info!("LLM message sent successfully");
             // Flush для гарантии отправки
             if let Err(e) = sender.flush().await {
-                error!("Failed to flush WebSocket after LLM message: {}", e);
+                warn!("Failed to flush WebSocket after LLM message (connection may be closed): {}", e);
             }
         }
         Err(e) => {
-            error!("Failed to send LLM message: {}", e);
-            return Err(anyhow::anyhow!("Failed to send LLM message: {}", e));
+            let error_msg = format!("{}", e);
+            if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
+                warn!("Client closed connection before LLM message could be sent. Continuing with TTS anyway.");
+                // Продолжаем обработку для TTS
+            } else {
+                error!("Failed to send LLM message: {}", e);
+                return Err(anyhow::anyhow!("Failed to send LLM message: {}", e));
+            }
         }
     }
 
@@ -561,12 +656,18 @@ async fn handle_stt_message(
         Ok(_) => {
             info!("TTS audio sent successfully");
             if let Err(e) = sender.flush().await {
-                error!("Failed to flush WebSocket after TTS audio: {}", e);
+                warn!("Failed to flush WebSocket after TTS audio (connection may be closed): {}", e);
             }
         }
         Err(e) => {
-            error!("Failed to send TTS audio: {}", e);
-            return Err(anyhow::anyhow!("Failed to send TTS audio: {}", e));
+            let error_msg = format!("{}", e);
+            if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
+                warn!("Client closed connection before TTS audio could be sent. This is normal if client disconnected.");
+                // Это нормально, если клиент отключился - просто логируем
+            } else {
+                error!("Failed to send TTS audio: {}", e);
+                return Err(anyhow::anyhow!("Failed to send TTS audio: {}", e));
+            }
         }
     }
 

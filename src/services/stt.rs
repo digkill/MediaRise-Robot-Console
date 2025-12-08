@@ -1,9 +1,10 @@
 //! Speech-to-Text сервис
 
 use anyhow::Context;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 use crate::config::SttConfig;
+use crate::utils::audio::utils;
 
 const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 
@@ -66,15 +67,54 @@ impl SttService {
         );
         info!("STT endpoint: {}", endpoint);
 
-        // Конвертируем аудио в формат, который понимает OpenAI
-        // OpenAI Whisper принимает различные форматы, включая PCM
+        // ============================================
+        // КОНВЕРТАЦИЯ PCM В WAV ФОРМАТ
+        // ============================================
+        // OpenAI Whisper API требует аудио файл с заголовком (WAV, MP3, WebM и т.д.)
+        // Сырые PCM байты не принимаются - нужен полноценный WAV файл
+        
+        // Проверяем, является ли это уже WAV файлом (начинается с "RIFF")
+        let is_wav = audio_data.len() >= 4 && &audio_data[0..4] == b"RIFF";
+        let is_webm = audio_data.len() >= 4 && &audio_data[0..4] == b"\x1a\x45\xdf\xa3";
+        let is_mp3 = audio_data.len() >= 3 && &audio_data[0..3] == b"ID3";
+        
+        let (audio_file, file_name, mime_type) = if is_wav {
+            // Уже WAV файл - используем как есть
+            info!("Audio is already in WAV format");
+            (audio_data.to_vec(), "audio.wav", "audio/wav")
+        } else if is_webm {
+            // WebM файл - используем как есть
+            info!("Audio is in WebM format");
+            (audio_data.to_vec(), "audio.webm", "audio/webm")
+        } else if is_mp3 {
+            // MP3 файл - используем как есть
+            info!("Audio is in MP3 format");
+            (audio_data.to_vec(), "audio.mp3", "audio/mpeg")
+        } else {
+            // Сырые PCM байты - конвертируем в WAV
+            // Предполагаем стандартные параметры: 48kHz, моно, 16-bit
+            info!("Converting raw PCM to WAV format (assuming 48kHz, mono, 16-bit)");
+            
+            // Конвертируем байты в PCM samples
+            let pcm_samples = utils::bytes_to_pcm_samples(audio_data)
+                .context("Failed to convert bytes to PCM samples")?;
+            
+            // Конвертируем PCM samples в WAV файл
+            // Параметры: 48kHz (стандарт для Opus), моно (1 канал), 16-bit
+            let wav_data = utils::pcm_to_wav(&pcm_samples, 48000, 1);
+            
+            info!("Converted PCM to WAV: {} bytes -> {} bytes", audio_data.len(), wav_data.len());
+            (wav_data, "audio.wav", "audio/wav")
+        };
+
+        // Создаем multipart форму для отправки
         let form = reqwest::multipart::Form::new()
             .text("model", "whisper-1")
             .part(
                 "file",
-                reqwest::multipart::Part::bytes(audio_data.to_vec())
-                    .file_name("audio.webm")
-                    .mime_str("audio/webm")?,
+                reqwest::multipart::Part::bytes(audio_file)
+                    .file_name(file_name)
+                    .mime_str(mime_type)?,
             );
 
         let response = self

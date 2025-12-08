@@ -184,6 +184,55 @@ pub mod utils {
         bytes
     }
 
+    /// Конвертирует PCM samples в WAV файл с заголовком
+    /// 
+    /// WAV файл состоит из:
+    /// - RIFF заголовок (12 байт)
+    /// - fmt chunk (24 байта) - описание формата аудио
+    /// - data chunk заголовок (8 байт)
+    /// - PCM данные
+    /// 
+    /// Параметры:
+    /// - samples: PCM сэмплы (i16, little-endian)
+    /// - sample_rate: частота дискретизации (обычно 48000 для Opus)
+    /// - channels: количество каналов (1 = моно, 2 = стерео)
+    /// 
+    /// Возвращает полный WAV файл как Vec<u8>
+    pub fn pcm_to_wav(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
+        let pcm_data = pcm_samples_to_bytes(samples);
+        let data_size = pcm_data.len() as u32;
+        
+        // Размер файла минус 8 байт (RIFF и размер)
+        let file_size = 36 + data_size;
+        
+        // Размер fmt chunk (16 байт данных + 8 байт заголовка = 24 байта)
+        let fmt_size = 16u32;
+        
+        let mut wav = Vec::with_capacity(44 + pcm_data.len());
+        
+        // RIFF заголовок (12 байт)
+        wav.extend_from_slice(b"RIFF");                    // Chunk ID
+        wav.extend_from_slice(&file_size.to_le_bytes());   // Chunk size
+        wav.extend_from_slice(b"WAVE");                    // Format
+        
+        // fmt chunk (24 байта)
+        wav.extend_from_slice(b"fmt ");                    // Subchunk1ID
+        wav.extend_from_slice(&fmt_size.to_le_bytes());     // Subchunk1Size (16)
+        wav.extend_from_slice(&1u16.to_le_bytes());         // AudioFormat (1 = PCM)
+        wav.extend_from_slice(&channels.to_le_bytes());     // NumChannels
+        wav.extend_from_slice(&sample_rate.to_le_bytes());  // SampleRate
+        wav.extend_from_slice(&(sample_rate * channels as u32 * 2).to_le_bytes()); // ByteRate
+        wav.extend_from_slice(&(channels * 2).to_le_bytes()); // BlockAlign
+        wav.extend_from_slice(&16u16.to_le_bytes());        // BitsPerSample (16-bit)
+        
+        // data chunk заголовок + данные (8 байт заголовка + данные)
+        wav.extend_from_slice(b"data");                    // Subchunk2ID
+        wav.extend_from_slice(&data_size.to_le_bytes());     // Subchunk2Size
+        wav.extend_from_slice(&pcm_data);                  // PCM данные
+        
+        wav
+    }
+
     /// Нормализует аудио данные (приводит к диапазону -1.0..1.0)
     pub fn normalize_audio(samples: &mut [i16]) {
         let max_amplitude = samples.iter().map(|&s| s.abs() as u16).max().unwrap_or(1) as f32;
