@@ -1,0 +1,30 @@
+[Unit]
+Description=MediaRise Robot Console Backend Server
+After=network.target mysql.service postgresql.service
+
+[Service]
+Type=simple
+User=mediarise
+Group=mediarise
+WorkingDirectory=/opt/mediarise-robot-console
+ExecStart=/opt/mediarise-robot-console/bin/mediarise-robot-console
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mediarise-robot-console
+
+# Environment variables (optional, can be overridden by .env file)
+# Environment="RUST_LOG=info"
+# Environment="DATABASE_URL=mysql://user:password@localhost/mediarise"
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mediarise-robot-console/storage
+
+[Install]
+WantedBy=multi-user.target
+

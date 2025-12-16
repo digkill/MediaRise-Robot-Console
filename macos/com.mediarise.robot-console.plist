@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mediarise.robot-console</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/mediarise-robot-console/bin/mediarise-robot-console</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/opt/mediarise-robot-console</string>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+    
+    <key>StandardOutPath</key>
+    <string>/opt/mediarise-robot-console/logs/stdout.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/opt/mediarise-robot-console/logs/stderr.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    
+    <key>ProcessType</key>
+    <string>Background</string>
+    
+    <key>Nice</key>
+    <integer>0</integer>
+</dict>
+</plist>
+

@@ -64,13 +64,26 @@ xiaozhi-backend/
 
 ## Установка и запуск
 
-### Требования
+### Быстрая установка как системный сервис
+
+Для установки сервера как демона (systemd на Linux или LaunchDaemon на macOS):
+
+```bash
+sudo ./install.sh
+```
+
+Подробная инструкция: [INSTALL.md](INSTALL.md)
+
+### Ручная установка (для разработки)
+
+#### Требования
 
 - Rust 1.70+
-- PostgreSQL или SQLite (для базы данных)
+- PostgreSQL, MySQL или SQLite (для базы данных)
 - Grok API ключ
+- OpenAI API ключи (для STT/TTS)
 
-### Настройка
+#### Настройка
 
 1. Скопируйте `.env.example` в `.env` и заполните:
 
