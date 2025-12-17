@@ -9,6 +9,7 @@
 // Импортируем нужные типы из библиотеки axum (веб-фреймворк для Rust)
 use axum::{
     extract::ws::WebSocketUpgrade,  // Для обновления HTTP соединения до WebSocket
+    http::HeaderMap,
     response::Response,              // Тип для HTTP ответов
     routing::{get, post},            // Функции для создания маршрутов (GET, POST)
     Router,                          // Роутер - объект, который направляет запросы к нужным обработчикам
@@ -181,15 +182,25 @@ pub struct AppState {
 /// 4. Функция-обработчик получает WebSocket соединение и начинает обрабатывать сообщения
 async fn websocket_handler(
     ws: WebSocketUpgrade,  // Объект для обновления HTTP до WebSocket
+    headers: HeaderMap,
     AxumState(state): AxumState<AppState>,  // Извлекаем состояние из запроса
 ) -> Response {
+    let header_device_id = headers
+        .get("Device-Id")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     // on_upgrade вызывается, когда HTTP соединение успешно обновлено до WebSocket
     // socket - это установленное WebSocket соединение
     // Теперь можно отправлять и получать сообщения в реальном времени
-    ws.on_upgrade(|socket| {
+    ws.on_upgrade(move |socket| {
         // Вызываем функцию handle_connection из модуля websocket
         // Она будет обрабатывать все сообщения от клиента
         // Передаем socket и состояние (config, services, storage)
-        websocket::handle_connection(socket, (state.config, state.services, state.storage))
+        websocket::handle_connection(
+            socket,
+            (state.config, state.services, state.storage),
+            header_device_id,
+        )
     })
 }

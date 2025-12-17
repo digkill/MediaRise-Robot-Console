@@ -12,7 +12,7 @@ use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::services::Services;
+use crate::services::{llm::ChatMessage, session::MessageDirection, Services};
 use crate::storage::Storage;
 use crate::websocket::audio::AudioProcessor;
 use crate::websocket::protocol::{AudioParams, Features, HelloMessage, Message};
@@ -22,16 +22,75 @@ use crate::websocket::session::{AudioParams as SessionAudioParams, SessionManage
 static SESSION_MANAGER: once_cell::sync::Lazy<Arc<SessionManager>> =
     once_cell::sync::Lazy::new(|| Arc::new(SessionManager::new()));
 
+fn detect_emotion(text: &str) -> &'static str {
+    let lower = text.to_lowercase();
+    let contains = |patterns: &[&str]| patterns.iter().any(|p| lower.contains(p));
+    if contains(&["😂", "😄", "😃", "😁", "рад", "весел", "улыб", "haha"]) {
+        "happy"
+    } else if contains(&["😍", "😘", "💋", "люблю", "милый", "sexy", "❤️", "💖"]) {
+        "romantic"
+    } else if contains(&["😢", "😭", "печал", "груст", "sad"]) {
+        "sad"
+    } else if contains(&["😡", "злюсь", "раздраж", "бесит", "грр"]) {
+        "angry"
+    } else if contains(&["😱", "испуг", "боюсь", "ужас"]) {
+        "scared"
+    } else {
+        "neutral"
+    }
+}
+
+async fn log_session_message(
+    session_service: &Arc<crate::services::session::SessionService>,
+    session_id: Option<&Uuid>,
+    direction: MessageDirection,
+    message_type: &str,
+    payload: &str,
+) {
+    if let Some(id) = session_id {
+        if let Err(err) = session_service
+            .log_message(id, direction, message_type, payload)
+            .await
+        {
+            warn!("Failed to log {} message: {}", message_type, err);
+        }
+    }
+}
+
+async fn build_llm_messages(services: &Services, user_text: &str) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    match services.knowledge.list_recent(5).await {
+        Ok(entries) => {
+            for entry in entries {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("{}: {}", entry.title, entry.content),
+                });
+            }
+        }
+        Err(err) => {
+            warn!("Failed to load custom knowledge: {}", err);
+        }
+    }
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: user_text.to_string(),
+    });
+    messages
+}
+
 pub async fn handle_connection(
     socket: WebSocket,
     (config, services, storage): (Config, Services, Storage),
+    device_header: Option<String>,
 ) {
     info!("New WebSocket connection");
 
     let (mut sender, mut receiver) = socket.split();
     let mut session_id: Option<Uuid> = None;
     let mut audio_processor: Option<AudioProcessor> = None;
-    let mut device_id: Option<String> = None;
+    let mut device_id: Option<String> = device_header;
+    let session_service = services.session.clone();
 
     // Ожидаем hello сообщение
     while let Some(msg) = receiver.next().await {
@@ -64,7 +123,9 @@ pub async fn handle_connection(
                             .map(|_| "unknown".to_string())
                             .unwrap_or_else(|| "unknown".to_string());
 
-                        device_id = Some(dev_id.clone());
+                        let resolved_device_id =
+                            device_id.clone().unwrap_or_else(|| dev_id.clone());
+                        device_id = Some(resolved_device_id.clone());
 
                         let sid = SESSION_MANAGER
                             .create_session(
@@ -77,6 +138,21 @@ pub async fn handle_connection(
                             .await;
 
                         session_id = Some(sid);
+
+                        if let Err(err) =
+                            session_service.persist_session(&sid, &resolved_device_id).await
+                        {
+                            warn!("Failed to persist session {}: {}", sid, err);
+                        }
+
+                        log_session_message(
+                            &session_service,
+                            Some(&sid),
+                            MessageDirection::Incoming,
+                            "hello",
+                            &text,
+                        )
+                        .await;
 
                         // Создаем аудио процессор
                         let mut params = crate::websocket::audio::AudioProcessingParams::default();
@@ -108,14 +184,23 @@ pub async fn handle_connection(
                             audio_format: response_audio_format, // Возвращаем формат обратно клиенту
                         });
 
+                        let response_json =
+                            serde_json::to_string(&response).unwrap_or_default();
                         if let Err(e) = sender
-                            .send(WsMessage::Text(
-                                serde_json::to_string(&response).unwrap_or_default(),
-                            ))
+                            .send(WsMessage::Text(response_json.clone()))
                             .await
                         {
                             error!("Failed to send hello response: {}", e);
                             break;
+                        } else {
+                            log_session_message(
+                                &session_service,
+                                Some(&sid),
+                                MessageDirection::Outgoing,
+                                "hello",
+                                &response_json,
+                            )
+                            .await;
                         }
 
                         info!("Session created: {}", sid);
@@ -155,6 +240,14 @@ pub async fn handle_connection(
             Ok(WsMessage::Text(text)) => {
                 match serde_json::from_str::<Message>(&text) {
                     Ok(Message::Listen(listen)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "listen",
+                            &text,
+                        )
+                        .await;
                         info!("Listen message: {:?}", listen);
                         if listen.state == "start" {
                             // Начинаем прослушивание
@@ -177,7 +270,27 @@ pub async fn handle_connection(
                                             },
                                         );
                                         if let Ok(json) = serde_json::to_string(&error_msg) {
-                                            let _ = sender.send(WsMessage::Text(json)).await;
+                                            match sender
+                                                .send(WsMessage::Text(json.clone()))
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    log_session_message(
+                                                        &session_service,
+                                                        Some(&session_id),
+                                                        MessageDirection::Outgoing,
+                                                        "system",
+                                                        &json,
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(send_err) => {
+                                                    error!(
+                                                        "Failed to send error message: {}",
+                                                        send_err
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -187,6 +300,14 @@ pub async fn handle_connection(
                         }
                     }
                     Ok(Message::Stt(stt)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "stt",
+                            &text,
+                        )
+                        .await;
                         info!("STT message received: '{}'", stt.text);
                         // Обрабатываем транскрибированный текст через LLM
                         match handle_stt_message(&services, &session_id, &stt.text, &mut sender)
@@ -205,15 +326,40 @@ pub async fn handle_connection(
                                         command: format!("error: {}", e),
                                     });
                                 if let Ok(json) = serde_json::to_string(&error_msg) {
-                                    if let Err(send_err) = sender.send(WsMessage::Text(json)).await
+                                    match sender
+                                        .send(WsMessage::Text(json.clone()))
+                                        .await
                                     {
-                                        error!("Failed to send error message: {}", send_err);
+                                        Ok(_) => {
+                                            log_session_message(
+                                                &session_service,
+                                                Some(&session_id),
+                                                MessageDirection::Outgoing,
+                                                "system",
+                                                &json,
+                                            )
+                                            .await;
+                                        }
+                                        Err(send_err) => {
+                                            error!(
+                                                "Failed to send error message: {}",
+                                                send_err
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                     Ok(Message::Tts(tts)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "tts",
+                            &text,
+                        )
+                        .await;
                         if let Some(text) = tts.text {
                             info!("TTS request: {}", text);
                             if let Err(e) = handle_tts_request(
@@ -230,6 +376,14 @@ pub async fn handle_connection(
                         }
                     }
                     Ok(Message::Llm(llm)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "llm",
+                            &text,
+                        )
+                        .await;
                         if let Some(text) = llm.text {
                             info!("LLM message: {}", text);
                             if let Err(e) =
@@ -240,6 +394,14 @@ pub async fn handle_connection(
                         }
                     }
                     Ok(Message::Mcp(mcp)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "mcp",
+                            &text,
+                        )
+                        .await;
                         info!("MCP message: {:?}", mcp.payload);
                         if let Err(e) =
                             handle_mcp_message(&services, &session_id, mcp.payload, &mut sender)
@@ -249,14 +411,38 @@ pub async fn handle_connection(
                         }
                     }
                     Ok(Message::System(system)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "system",
+                            &text,
+                        )
+                        .await;
                         info!("System command: {}", system.command);
                         // Обрабатываем системные команды
                     }
                     Ok(Message::Abort(abort)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "abort",
+                            &text,
+                        )
+                        .await;
                         info!("Abort message: {:?}", abort.reason);
                         break;
                     }
                     Ok(Message::Goodbye(_)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "goodbye",
+                            &text,
+                        )
+                        .await;
                         info!("Goodbye message");
                         break;
                     }
@@ -359,10 +545,26 @@ pub async fn handle_connection(
                                         },
                                     );
                                     if let Ok(json) = serde_json::to_string(&error_msg) {
-                                        if let Err(send_err) =
-                                            sender.send(WsMessage::Text(json)).await
+                                        match sender
+                                            .send(WsMessage::Text(json.clone()))
+                                            .await
                                         {
-                                            error!("Failed to send error message: {}", send_err);
+                                            Ok(_) => {
+                                                log_session_message(
+                                                    &session_service,
+                                                    Some(&session_id),
+                                                    MessageDirection::Outgoing,
+                                                    "system",
+                                                    &json,
+                                                )
+                                                .await;
+                                            }
+                                            Err(send_err) => {
+                                                error!(
+                                                    "Failed to send error message: {}",
+                                                    send_err
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -386,8 +588,26 @@ pub async fn handle_connection(
                                     command: format!("error: Failed to process audio: {}", e),
                                 });
                             if let Ok(json) = serde_json::to_string(&error_msg) {
-                                if let Err(send_err) = sender.send(WsMessage::Text(json)).await {
-                                    error!("Failed to send error message: {}", send_err);
+                                match sender
+                                    .send(WsMessage::Text(json.clone()))
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        log_session_message(
+                                            &session_service,
+                                            Some(&session_id),
+                                            MessageDirection::Outgoing,
+                                            "system",
+                                            &json,
+                                        )
+                                        .await;
+                                    }
+                                    Err(send_err) => {
+                                        error!(
+                                            "Failed to send error message: {}",
+                                            send_err
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -436,6 +656,10 @@ pub async fn handle_connection(
     SESSION_MANAGER.remove_session(&session_id).await;
     info!("Session removed: {}", session_id);
 
+    if let Err(err) = session_service.close_session(&session_id).await {
+        warn!("Failed to close session {}: {}", session_id, err);
+    }
+
     info!("WebSocket connection ended");
 }
 
@@ -449,10 +673,7 @@ async fn handle_listen_text(
     info!("Processing listen text: '{}'", text);
 
     // Обрабатываем текст через LLM
-    let messages = vec![crate::services::llm::ChatMessage {
-        role: "user".to_string(),
-        content: text.to_string(),
-    }];
+    let messages = build_llm_messages(services, text).await;
 
     info!("Calling LLM service with {} messages", messages.len());
     let mut response = match services.llm.chat(messages).await {
@@ -474,22 +695,31 @@ async fn handle_listen_text(
     }
 
     // Отправляем LLM ответ текстом
+    let emotion = detect_emotion(&response).to_string();
     let llm_msg = Message::Llm(crate::websocket::protocol::LlmMessage {
         session_id: session_id.to_string(),
-        emotion: None,
+        emotion: Some(emotion.clone()),
         text: Some(response.clone()),
     });
 
     let llm_json = serde_json::to_string(&llm_msg).context("Failed to serialize LLM message")?;
 
     info!("Sending LLM message: {}", llm_json);
-    match sender.send(WsMessage::Text(llm_json)).await {
+    match sender.send(WsMessage::Text(llm_json.clone())).await {
         Ok(_) => {
             info!("LLM message sent successfully");
             // Flush для гарантии отправки
             if let Err(e) = sender.flush().await {
                 error!("Failed to flush WebSocket after LLM message: {}", e);
             }
+            log_session_message(
+                &services.session,
+                Some(session_id),
+                MessageDirection::Outgoing,
+                "llm",
+                &llm_json,
+            )
+            .await;
         }
         Err(e) => {
             error!("Failed to send LLM message: {}", e);
@@ -517,12 +747,21 @@ async fn handle_listen_text(
     };
 
     info!("Sending TTS audio: {} bytes", tts_audio.len());
+    let tts_len = tts_audio.len();
     match sender.send(WsMessage::Binary(tts_audio)).await {
         Ok(_) => {
             info!("TTS audio sent successfully");
             if let Err(e) = sender.flush().await {
                 warn!("Failed to flush WebSocket after TTS audio (connection may be closed): {}", e);
             }
+            log_session_message(
+                &services.session,
+                Some(session_id),
+                MessageDirection::Outgoing,
+                "tts_audio",
+                &format!("{} bytes", tts_len),
+            )
+            .await;
         }
         Err(e) => {
             let error_msg = format!("{}", e);
@@ -557,7 +796,7 @@ async fn handle_stt_message(
     let stt_json = serde_json::to_string(&stt_msg).context("Failed to serialize STT message")?;
 
     info!("Sending STT message: {}", stt_json);
-    match sender.send(WsMessage::Text(stt_json)).await {
+    match sender.send(WsMessage::Text(stt_json.clone())).await {
         Ok(_) => {
             info!("STT message sent successfully");
             if let Err(e) = sender.flush().await {
@@ -565,6 +804,14 @@ async fn handle_stt_message(
                 // Но это не критично - сообщение уже отправлено
                 warn!("Failed to flush WebSocket after STT message (connection may be closed): {}", e);
             }
+            log_session_message(
+                &services.session,
+                Some(session_id),
+                MessageDirection::Outgoing,
+                "stt",
+                &stt_json,
+            )
+            .await;
         }
         Err(e) => {
             // Если соединение закрыто клиентом, просто логируем и продолжаем
@@ -581,10 +828,7 @@ async fn handle_stt_message(
     }
 
     // Обрабатываем транскрибированный текст через LLM
-    let messages = vec![crate::services::llm::ChatMessage {
-        role: "user".to_string(),
-        content: text.to_string(),
-    }];
+    let messages = build_llm_messages(services, text).await;
 
     info!("Calling LLM service with {} messages", messages.len());
     let mut response = match services.llm.chat(messages).await {
@@ -605,22 +849,31 @@ async fn handle_stt_message(
     }
 
     // Отправляем LLM ответ
+    let emotion = detect_emotion(&response).to_string();
     let llm_msg = Message::Llm(crate::websocket::protocol::LlmMessage {
         session_id: session_id.to_string(),
-        emotion: None,
+        emotion: Some(emotion.clone()),
         text: Some(response.clone()),
     });
 
     let llm_json = serde_json::to_string(&llm_msg).context("Failed to serialize LLM message")?;
 
     info!("Sending LLM message: {}", llm_json);
-    match sender.send(WsMessage::Text(llm_json)).await {
+    match sender.send(WsMessage::Text(llm_json.clone())).await {
         Ok(_) => {
             info!("LLM message sent successfully");
             // Flush для гарантии отправки
             if let Err(e) = sender.flush().await {
                 warn!("Failed to flush WebSocket after LLM message (connection may be closed): {}", e);
             }
+            log_session_message(
+                &services.session,
+                Some(session_id),
+                MessageDirection::Outgoing,
+                "llm",
+                &llm_json,
+            )
+            .await;
         }
         Err(e) => {
             let error_msg = format!("{}", e);
@@ -652,12 +905,21 @@ async fn handle_stt_message(
     };
 
     info!("Sending TTS audio: {} bytes", tts_audio.len());
+    let tts_len = tts_audio.len();
     match sender.send(WsMessage::Binary(tts_audio)).await {
         Ok(_) => {
             info!("TTS audio sent successfully");
             if let Err(e) = sender.flush().await {
                 warn!("Failed to flush WebSocket after TTS audio (connection may be closed): {}", e);
             }
+            log_session_message(
+                &services.session,
+                Some(session_id),
+                MessageDirection::Outgoing,
+                "tts_audio",
+                &format!("{} bytes", tts_len),
+            )
+            .await;
         }
         Err(e) => {
             let error_msg = format!("{}", e);
@@ -688,9 +950,19 @@ async fn handle_tts_request(
     let audio_format_option = session.and_then(|s| s.audio_format);
     let audio_format = audio_format_option.as_deref();
     let opus_audio = services.tts.synthesize_with_format(text, audio_format).await?;
+    let audio_len = opus_audio.len();
 
     // Отправляем аудио
     sender.send(WsMessage::Binary(opus_audio)).await?;
+
+    log_session_message(
+        &services.session,
+        Some(session_id),
+        MessageDirection::Outgoing,
+        "tts_audio",
+        &format!("{} bytes", audio_len),
+    )
+    .await;
 
     Ok(())
 }
@@ -702,22 +974,30 @@ async fn handle_llm_message(
     text: &str,
     sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
 ) -> anyhow::Result<()> {
-    let messages = vec![crate::services::llm::ChatMessage {
-        role: "user".to_string(),
-        content: text.to_string(),
-    }];
+    let messages = build_llm_messages(services, text).await;
 
     let response = services.llm.chat(messages).await?;
 
+    let emotion = detect_emotion(&response).to_string();
     let response_msg = Message::Llm(crate::websocket::protocol::LlmMessage {
         session_id: _session_id.to_string(),
-        emotion: None,
+        emotion: Some(emotion.clone()),
         text: Some(response),
     });
 
+    let llm_json = serde_json::to_string(&response_msg)?;
     sender
-        .send(WsMessage::Text(serde_json::to_string(&response_msg)?))
+        .send(WsMessage::Text(llm_json.clone()))
         .await?;
+
+    log_session_message(
+        &services.session,
+        Some(_session_id),
+        MessageDirection::Outgoing,
+        "llm",
+        &llm_json,
+    )
+    .await;
 
     Ok(())
 }
@@ -738,9 +1018,19 @@ async fn handle_mcp_message(
         payload: response,
     });
 
+    let mcp_json = serde_json::to_string(&response_msg)?;
     sender
-        .send(WsMessage::Text(serde_json::to_string(&response_msg)?))
+        .send(WsMessage::Text(mcp_json.clone()))
         .await?;
+
+    log_session_message(
+        &services.session,
+        Some(_session_id),
+        MessageDirection::Outgoing,
+        "mcp",
+        &mcp_json,
+    )
+    .await;
 
     Ok(())
 }
@@ -827,8 +1117,23 @@ async fn handle_raw_audio(
             command: "warning: Empty transcription result".to_string(),
         });
         if let Ok(json) = serde_json::to_string(&empty_msg) {
-            if let Err(send_err) = sender.send(WsMessage::Text(json)).await {
-                error!("Failed to send empty transcription warning: {}", send_err);
+            match sender
+                .send(WsMessage::Text(json.clone()))
+                .await
+            {
+                Ok(_) => {
+                    log_session_message(
+                        &services.session,
+                        Some(session_id),
+                        MessageDirection::Outgoing,
+                        "system",
+                        &json,
+                    )
+                    .await;
+                }
+                Err(send_err) => {
+                    error!("Failed to send empty transcription warning: {}", send_err);
+                }
             }
         }
     }

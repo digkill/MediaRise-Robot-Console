@@ -164,6 +164,25 @@
             color: #666;
             margin: 0;
         }
+        .hint {
+            font-size: 12px;
+            color: #555;
+            display: block;
+            margin-top: 5px;
+        }
+        .file-instructions {
+            background: #f4f6fb;
+            border: 1px dashed #a6b4df;
+            padding: 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+        .file-instructions code {
+            background: #eef1fb;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
     </style>
 </head>
 <body>
@@ -182,6 +201,16 @@
                 </select>
                 <small style="display: block; margin-top: 5px; color: #666;">
                     Выберите формат аудио ответа от сервера. MP3 поддерживается браузерами напрямую, Opus требует декодирования.
+                </small>
+            </div>
+            <div style="margin: 10px 0;">
+                <label for="inputAudioFormat">Формат аудио, которое вы отправляете:</label>
+                <select id="inputAudioFormat" style="margin-left: 10px; padding: 5px;">
+                    <option value="opus" selected>Opus (WebM из микрофона, 48 kHz)</option>
+                    <option value="mp3">MP3 (загруженный файл, 44.1 kHz)</option>
+                </select>
+                <small class="hint">
+                    Для прямой записи микрофона используйте Opus. Для MP3 загрузите файл или сконвертируйте голос заранее.
                 </small>
             </div>
             <div>
@@ -226,6 +255,9 @@
                 <button id="stopRecordBtn" onclick="stopRecording()" style="display:none;">⏹ Остановить запись</button>
                 <button id="sendAudioBtn" onclick="sendRecordedAudio()" disabled>📤 Отправить записанное аудио</button>
             </div>
+            <small id="recordingHint" class="hint">
+                Доступно только для формата Opus (WebM). Для MP3 используйте загрузку файла ниже.
+            </small>
             <div id="audioStatus" style="margin-top: 10px; padding: 5px; background: #f0f0f0; border-radius: 3px; font-size: 12px;">
                 Статус: Не записывается
             </div>
@@ -236,6 +268,18 @@
             <h4>📝 Отправка текста (альтернатива)</h4>
             <p><small>Если нет микрофона, можно отправить текст напрямую</small></p>
             <button onclick="sendListenWithText()">Отправить текст (Listen)</button>
+            <hr>
+            <h4>📁 Отправка аудио файла (Opus/MP3)</h4>
+            <input type="file" id="audioFileInput" accept=".mp3,.opus,.ogg,.webm,.wav,audio/*" style="margin-bottom:8px;">
+            <div>
+                <button id="sendFileBtn" onclick="sendAudioFile()">📤 Отправить выбранный файл</button>
+            </div>
+            <div class="file-instructions">
+                <strong>Подготовка MP3:</strong>
+                <div>Сконвертируйте запись командой:</div>
+                <code>ffmpeg -i input.wav -ar 44100 -ac 1 -f mp3 chunk.mp3</code>
+                <div>Загрузите полученный файл и отправьте. Можно отправлять и Opus/OGG.</div>
+            </div>
         </div>
     </div>
     
@@ -279,31 +323,54 @@
         let audioLevelInterval = null;
         let pendingResponseTimer = null;
         const highlightTimers = {};
+        let selectedInputAudioFormat = 'opus';
+
+        function getInputAudioConfig() {
+            const select = document.getElementById('inputAudioFormat');
+            selectedInputAudioFormat = select ? select.value : 'opus';
+            if (selectedInputAudioFormat === 'mp3') {
+                return { format: 'mp3', sampleRate: 44100, channels: 1, frameDuration: 26 };
+            }
+            return { format: 'opus', sampleRate: 48000, channels: 1, frameDuration: 20 };
+        }
+
+        function updateRecordingAvailability() {
+            const config = getInputAudioConfig();
+            const recordBtn = document.getElementById('startRecordBtn');
+            const hint = document.getElementById('recordingHint');
+            if (recordBtn) {
+                const allowRecording = config.format === 'opus' && sessionId && ws && ws.readyState === WebSocket.OPEN;
+                recordBtn.disabled = !allowRecording;
+            }
+            if (hint) {
+                if (config.format === 'mp3') {
+                    hint.textContent = 'Доступно только для формата Opus (WebM). Для MP3 используйте загрузку файла ниже.';
+                } else {
+                    hint.textContent = 'Можно записывать напрямую. Отправляется WebM/Opus 48 kHz с микрофона.';
+                }
+            }
+        }
 
         function updateStatus(connected) {
             const status = document.getElementById('status');
             const connectBtn = document.getElementById('connectBtn');
             const disconnectBtn = document.getElementById('disconnectBtn');
-            const startRecordBtn = document.getElementById('startRecordBtn');
             
-                if (connected) {
+            if (connected) {
                 status.textContent = 'Подключено';
                 status.className = 'status connected';
                 connectBtn.disabled = true;
                 disconnectBtn.disabled = false;
-                if (sessionId) {
-                    document.getElementById('startRecordBtn').disabled = false;
-                }
             } else {
                 status.textContent = 'Отключено';
                 status.className = 'status disconnected';
                 connectBtn.disabled = false;
                 disconnectBtn.disabled = true;
-                document.getElementById('startRecordBtn').disabled = true;
                 if (isRecording) {
                     stopRecording();
                 }
             }
+            updateRecordingAvailability();
         }
 
         function addLog(message, type = 'info') {
@@ -331,6 +398,7 @@
                 updateStatus(true);
                 // Автоматически отправляем hello
                 sendHello();
+                updateRecordingAvailability();
             };
             
             ws.onmessage = async (event) => {
@@ -408,10 +476,7 @@
                             sessionId = data.session_id;
                             addLog(`✅ Hello принят! Session ID: ${sessionId}`, 'received');
                             addLog('Теперь можно отправлять аудио или текст', 'info');
-                            const startRecordBtn = document.getElementById('startRecordBtn');
-                            if (startRecordBtn) {
-                                startRecordBtn.disabled = false;
-                            }
+                            updateRecordingAvailability();
                         } else if (data.type === 'stt') {
                             addLog(`📝 Транскрипция (STT): "${data.text}"`, 'received');
                             updateSttOutput(data.text);
@@ -447,11 +512,13 @@
                 ws.close();
                 ws = null;
             }
+            updateRecordingAvailability();
         };
 
         function sendHello() {
             const audioFormat = document.getElementById('audioFormat')?.value || 'opus';
-            addLog(`📤 Отправка Hello с форматом: ${audioFormat}`, 'info');
+            const inputConfig = getInputAudioConfig();
+            addLog(`📤 Отправка Hello. Ответ: ${audioFormat}, отправка: ${inputConfig.format}`, 'info');
             const hello = {
                 type: "hello",
                 version: 3,
@@ -461,10 +528,10 @@
                     mcp: false
                 },
                 audio_params: {
-                    format: "opus",
-                    sample_rate: 48000,
-                    channels: 1,
-                    frame_duration: 20
+                    format: inputConfig.format,
+                    sample_rate: inputConfig.sampleRate,
+                    channels: inputConfig.channels,
+                    frame_duration: inputConfig.frameDuration
                 },
                 audio_format: audioFormat  // Важно: передаем выбранный формат
             };
@@ -519,17 +586,18 @@
             switch(type) {
                 case 'hello':
                     const audioFormat = document.getElementById('audioFormat')?.value || 'opus';
-                    addLog(`📤 Отправка Hello с форматом: ${audioFormat}`, 'info');
+                    const inputConfig = getInputAudioConfig();
+                    addLog(`📤 Отправка Hello с форматом ответа ${audioFormat} и входа ${inputConfig.format}`, 'info');
                     return {
                         type: "hello",
                         version: 3,
                         transport: "websocket",
                         features: { aec: true, mcp: false },
                         audio_params: {
-                            format: "opus",
-                            sample_rate: 48000,
-                            channels: 1,
-                            frame_duration: 20
+                            format: inputConfig.format,
+                            sample_rate: inputConfig.sampleRate,
+                            channels: inputConfig.channels,
+                            frame_duration: inputConfig.frameDuration
                         },
                         audio_format: audioFormat  // Важно: передаем выбранный формат
                     };
@@ -585,6 +653,12 @@
         async function startRecording() {
             if (!sessionId) {
                 addLog('⚠️ Сначала отправьте Hello для получения session_id', 'error');
+                return;
+            }
+
+            const inputConfig = getInputAudioConfig();
+            if (inputConfig.format !== 'opus') {
+                addLog('⚠️ Запись доступна только для Opus. Выберите Opus или загрузите MP3 файл.', 'error');
                 return;
             }
 
@@ -744,6 +818,12 @@
                 return;
             }
 
+             const inputConfig = getInputAudioConfig();
+             if (inputConfig.format !== 'opus') {
+                 addLog('⚠️ Отправка записанного аудио доступна только для формата Opus.', 'error');
+                 return;
+             }
+
             const audioBlob = new Blob(audioChunks, { type: 'audio/webm;codecs=opus' });
             addLog(`📤 Отправка аудио: ${audioBlob.size} bytes`, 'sent');
             showPendingResponse();
@@ -756,11 +836,55 @@
             audioChunks = [];
             document.getElementById('sendAudioBtn').disabled = true;
         }
+
+        window.sendAudioFile = async function sendAudioFile() {
+            if (!sessionId) {
+                addLog('⚠️ Сначала отправьте Hello для получения session_id', 'error');
+                return;
+            }
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addLog('⚠️ WebSocket не подключен', 'error');
+                return;
+            }
+            const fileInput = document.getElementById('audioFileInput');
+            if (!fileInput || fileInput.files.length === 0) {
+                addLog('⚠️ Не выбран аудио файл', 'error');
+                return;
+            }
+            const file = fileInput.files[0];
+            const detected = detectFileFormat(file);
+            addLog(`📤 Отправка файла ${file.name} (${formatBytes(file.size)}), формат: ${detected}`, 'sent');
+            showPendingResponse();
+            startPendingResponseTimer();
+            try {
+                ws.send(file);
+                addLog('✅ Файл отправлен. Ждем ответ...', 'info');
+            } catch (e) {
+                addLog(`❌ Ошибка отправки файла: ${e.message}`, 'error');
+            }
+        };
         
         function formatBytes(bytes) {
             if (bytes < 1024) return `${bytes} B`;
             if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
             return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        }
+
+        function detectFileFormat(file) {
+            if (!file) return 'unknown';
+            if (file.type.includes('mpeg') || file.name.endsWith('.mp3')) {
+                return 'mp3';
+            }
+            if (file.type.includes('ogg') || file.name.endsWith('.opus') || file.name.endsWith('.ogg')) {
+                return 'opus';
+            }
+            if (file.type.includes('wav') || file.name.endsWith('.wav')) {
+                return 'wav';
+            }
+            if (file.type.includes('webm') || file.name.endsWith('.webm')) {
+                return 'opus';
+            }
+            return 'unknown';
         }
 
         function updateResponseBox(elementId, text) {
@@ -1231,6 +1355,14 @@
         window.onload = () => {
             addLog('Готов к подключению. Нажмите "Подключиться"', 'info');
             addLog('💡 После подключения и Hello можно начать запись аудио', 'info');
+            const inputFormatSelect = document.getElementById('inputAudioFormat');
+            if (inputFormatSelect) {
+                inputFormatSelect.addEventListener('change', () => {
+                    selectedInputAudioFormat = inputFormatSelect.value;
+                    updateRecordingAvailability();
+                });
+            }
+            updateRecordingAvailability();
         };
     </script>
 </body>

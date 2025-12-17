@@ -2,10 +2,10 @@
 
 -- Devices table
 CREATE TABLE IF NOT EXISTS devices (
-    device_id TEXT PRIMARY KEY,
-    client_id TEXT NOT NULL,
-    serial_number TEXT,
-    firmware_version TEXT NOT NULL,
+    device_id VARCHAR(64) PRIMARY KEY,
+    client_id VARCHAR(64) NOT NULL,
+    serial_number VARCHAR(64),
+    firmware_version VARCHAR(32) NOT NULL,
     activated BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS devices (
 
 -- Sessions table
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    device_id TEXT NOT NULL,
+    id CHAR(36) PRIMARY KEY,
+    device_id VARCHAR(64) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (device_id) REFERENCES devices(device_id)
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 -- Firmware versions table
 CREATE TABLE IF NOT EXISTS firmware_versions (
-    version TEXT PRIMARY KEY,
+    version VARCHAR(32) PRIMARY KEY,
     url TEXT NOT NULL,
     force_update BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -31,23 +31,22 @@ CREATE TABLE IF NOT EXISTS firmware_versions (
 
 -- Assets versions table
 CREATE TABLE IF NOT EXISTS assets_versions (
-    version TEXT PRIMARY KEY,
+    version VARCHAR(32) PRIMARY KEY,
     url TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Uploads table
 CREATE TABLE IF NOT EXISTS uploads (
-    id TEXT PRIMARY KEY,
-    device_id TEXT NOT NULL,
+    id CHAR(36) PRIMARY KEY,
+    device_id VARCHAR(64) NOT NULL,
     file_path TEXT NOT NULL,
-    file_type TEXT NOT NULL,
+    file_type VARCHAR(64) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (device_id) REFERENCES devices(device_id)
 );
 
 -- Create indexes
-CREATE INDEX IF NOT EXISTS idx_devices_client_id ON devices(client_id);
-CREATE INDEX IF NOT EXISTS idx_devices_serial_number ON devices(serial_number);
-CREATE INDEX IF NOT EXISTS idx_sessions_device_id ON sessions(device_id);
-
+CREATE INDEX idx_devices_client_id ON devices(client_id);
+CREATE INDEX idx_devices_serial_number ON devices(serial_number);
+CREATE INDEX idx_sessions_device_id ON sessions(device_id);
