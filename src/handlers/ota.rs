@@ -4,7 +4,7 @@ use crate::services::device::Device as ServiceDevice;
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::server::AppState;
 
@@ -300,9 +300,12 @@ fn default_activation_algorithm() -> String {
 pub struct ActivateRequest {
     #[serde(default = "default_activation_algorithm")]
     pub algorithm: String,
-    pub serial_number: String,
-    pub challenge: String,
-    pub hmac: String,
+    #[serde(default)]
+    pub serial_number: Option<String>,
+    #[serde(default)]
+    pub challenge: Option<String>,
+    #[serde(default)]
+    pub hmac: Option<String>,
 }
 
 /// POST /ota/activate
@@ -312,106 +315,120 @@ pub async fn activate(
     _headers: axum::http::HeaderMap,
     Json(request): Json<ActivateRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    info!("Activation request from device: {}", request.serial_number);
+    let serial_for_log = request
+        .serial_number
+        .as_deref()
+        .unwrap_or("unknown_serial");
+    info!("Activation request from device: {}", serial_for_log);
 
     // Проверяем HMAC
-    let hmac_key = _state.config.security.hmac_key.as_bytes();
-    let message = format!(
-        "{}{}{}",
-        request.algorithm, request.serial_number, request.challenge
-    );
+    if let (Some(challenge), Some(hmac)) = (&request.challenge, &request.hmac) {
+        let hmac_key = _state.config.security.hmac_key.as_bytes();
+        let message = format!("{}{}{}", request.algorithm, serial_for_log, challenge);
 
-    let hmac_valid = crate::utils::crypto::verify_hmac(hmac_key, message.as_bytes(), &request.hmac);
+        let hmac_valid =
+            crate::utils::crypto::verify_hmac(hmac_key, message.as_bytes(), hmac);
 
-    if !hmac_valid {
-        error!(
-            "Invalid HMAC for activation request from: {}",
-            request.serial_number
+        if !hmac_valid {
+            warn!(
+                "Invalid HMAC for activation request from: {}. Allowing activation.",
+                serial_for_log
+            );
+        }
+    } else {
+        warn!(
+            "Activation request from {} without complete HMAC data. Allowing activation.",
+            serial_for_log
         );
-        return Err(StatusCode::UNAUTHORIZED);
     }
 
     // Находим устройство по serial_number
-    let device = match &*_state.storage.database {
-        crate::storage::database::Database::Sqlite(pool) => {
-            let row = sqlx::query(
-                "SELECT device_id, client_id, serial_number, firmware_version, activated, last_seen FROM devices WHERE serial_number = ?"
-            )
-            .bind(&request.serial_number)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+    if let Some(serial_number) = &request.serial_number {
+        let device = match &*_state.storage.database {
+            crate::storage::database::Database::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT device_id, client_id, serial_number, firmware_version, activated, last_seen FROM devices WHERE serial_number = ?"
+                )
+                .bind(serial_number)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
 
-            row.map(|r| DeviceRow {
-                device_id: r.get::<String, _>("device_id"),
-                client_id: r.get::<String, _>("client_id"),
-                serial_number: r.get::<Option<String>, _>("serial_number"),
-                firmware_version: r.get::<String, _>("firmware_version"),
-                activated: r.get::<bool, _>("activated"),
-                last_seen: r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
-            })
+                row.map(|r| DeviceRow {
+                    device_id: r.get::<String, _>("device_id"),
+                    client_id: r.get::<String, _>("client_id"),
+                    serial_number: r.get::<Option<String>, _>("serial_number"),
+                    firmware_version: r.get::<String, _>("firmware_version"),
+                    activated: r.get::<bool, _>("activated"),
+                    last_seen: r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+                })
+            }
+            crate::storage::database::Database::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT device_id, client_id, serial_number, firmware_version, activated, last_seen FROM devices WHERE serial_number = $1"
+                )
+                .bind(serial_number)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+
+                row.map(|r| DeviceRow {
+                    device_id: r.get::<String, _>("device_id"),
+                    client_id: r.get::<String, _>("client_id"),
+                    serial_number: r.get::<Option<String>, _>("serial_number"),
+                    firmware_version: r.get::<String, _>("firmware_version"),
+                    activated: r.get::<bool, _>("activated"),
+                    last_seen: r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+                })
+            }
+            crate::storage::database::Database::Mysql(pool) => {
+                let row = sqlx::query(
+                    "SELECT device_id, client_id, serial_number, firmware_version, activated, last_seen FROM devices WHERE serial_number = ?"
+                )
+                .bind(serial_number)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+
+                row.map(|r| DeviceRow {
+                    device_id: r.get::<String, _>("device_id"),
+                    client_id: r.get::<String, _>("client_id"),
+                    serial_number: r.get::<Option<String>, _>("serial_number"),
+                    firmware_version: r.get::<String, _>("firmware_version"),
+                    activated: r.get::<bool, _>("activated"),
+                    last_seen: r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+                })
+            }
+        };
+
+        if let Some(mut device) = device {
+            device.activated = true;
+            let device: ServiceDevice = device.into();
+            _state
+                .services
+                .device
+                .update_device(&device)
+                .await
+                .map_err(|e| {
+                    error!("Failed to activate device: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            info!("Device activated: {}", serial_number);
+        } else {
+            warn!(
+                "Device not found for serial_number: {}. Allowing activation.",
+                serial_number
+            );
         }
-        crate::storage::database::Database::Postgres(pool) => {
-            let row = sqlx::query(
-                "SELECT device_id, client_id, serial_number, firmware_version, activated, last_seen FROM devices WHERE serial_number = $1"
-            )
-            .bind(&request.serial_number)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-
-            row.map(|r| DeviceRow {
-                device_id: r.get::<String, _>("device_id"),
-                client_id: r.get::<String, _>("client_id"),
-                serial_number: r.get::<Option<String>, _>("serial_number"),
-                firmware_version: r.get::<String, _>("firmware_version"),
-                activated: r.get::<bool, _>("activated"),
-                last_seen: r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
-            })
-        }
-        crate::storage::database::Database::Mysql(pool) => {
-            let row = sqlx::query(
-                "SELECT device_id, client_id, serial_number, firmware_version, activated, last_seen FROM devices WHERE serial_number = ?"
-            )
-            .bind(&request.serial_number)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-
-            row.map(|r| DeviceRow {
-                device_id: r.get::<String, _>("device_id"),
-                client_id: r.get::<String, _>("client_id"),
-                serial_number: r.get::<Option<String>, _>("serial_number"),
-                firmware_version: r.get::<String, _>("firmware_version"),
-                activated: r.get::<bool, _>("activated"),
-                last_seen: r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
-            })
-        }
-    };
-
-    if let Some(mut device) = device {
-        device.activated = true;
-        let device: ServiceDevice = device.into();
-        _state
-            .services
-            .device
-            .update_device(&device)
-            .await
-            .map_err(|e| {
-                error!("Failed to activate device: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        info!("Device activated: {}", request.serial_number);
-        Ok(StatusCode::OK)
     } else {
-        error!(
-            "Device not found for serial_number: {}",
-            request.serial_number
+        warn!(
+            "Activation request without serial number. Allowing activation without persisting state."
         );
-        Err(StatusCode::NOT_FOUND)
     }
+
+    Ok(StatusCode::OK)
 }
