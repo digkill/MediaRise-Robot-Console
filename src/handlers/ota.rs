@@ -292,8 +292,13 @@ impl From<DeviceRow> for ServiceDevice {
     }
 }
 
+fn default_activation_algorithm() -> String {
+    "hmac_sha256".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ActivateRequest {
+    #[serde(default = "default_activation_algorithm")]
     pub algorithm: String,
     pub serial_number: String,
     pub challenge: String,

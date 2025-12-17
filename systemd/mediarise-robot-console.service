@@ -28,3 +28,4 @@ ReadWritePaths=/opt/mediarise-robot-console/storage
 [Install]
 WantedBy=multi-user.target
 
+
