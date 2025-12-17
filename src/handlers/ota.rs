@@ -98,9 +98,24 @@ pub async fn check_version(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let device = if let Some(device) = device {
-        // Обновляем last_seen
-        let _ = state.services.device.update_last_seen(device_id).await;
+    let mut device = if let Some(mut device) = device {
+        if !device.activated {
+            info!("Auto-activating device {}", device_id);
+            device.activated = true;
+            device.last_seen = chrono::Utc::now();
+            state
+                .services
+                .device
+                .update_device(&device)
+                .await
+                .map_err(|e| {
+                    error!("Failed to auto-activate device {}: {}", device_id, e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        } else {
+            let _ = state.services.device.update_last_seen(device_id).await;
+            device.last_seen = chrono::Utc::now();
+        }
         device
     } else {
         // Создаем новое устройство
@@ -109,7 +124,7 @@ pub async fn check_version(
             client_id: client_id.to_string(),
             serial_number: serial_number.map(|s| s.to_string()),
             firmware_version: "0.0.0".to_string(),
-            activated: false,
+            activated: true,
             last_seen: chrono::Utc::now(),
         };
         state
