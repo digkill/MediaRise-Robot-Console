@@ -20,6 +20,8 @@ use crate::websocket::audio::AudioProcessor;
 use crate::websocket::protocol::{AudioParams, Features, HelloMessage, Message};
 use crate::websocket::session::{AudioParams as SessionAudioParams, SessionManager};
 
+const STREAMING_FRAME_DELAY_MS: u64 = 40;
+
 // Глобальный менеджер сессий
 static SESSION_MANAGER: once_cell::sync::Lazy<Arc<SessionManager>> =
     once_cell::sync::Lazy::new(|| Arc::new(SessionManager::new()));
@@ -761,7 +763,7 @@ async fn handle_listen_text(
                     error!("Failed to send Opus frame {}: {}", idx, e);
                     return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
                 }
-                sleep(Duration::from_millis(OPUS_FRAME_SIZE_MS as u64)).await;
+                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
             }
             sender.flush().await.map_err(|e| {
                 warn!(
@@ -941,7 +943,7 @@ async fn handle_stt_message(
                     error!("Failed to send Opus frame {}: {}", idx, e);
                     return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
                 }
-                sleep(Duration::from_millis(OPUS_FRAME_SIZE_MS as u64)).await;
+                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
             }
             sender.flush().await.map_err(|e| {
                 warn!(
@@ -1006,7 +1008,7 @@ async fn handle_tts_request(
                 if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
                     return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
                 }
-                sleep(Duration::from_millis(OPUS_FRAME_SIZE_MS as u64)).await;
+                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
             }
             if let Err(e) = sender.flush().await {
                 warn!("Failed to flush WebSocket after Opus frames: {}", e);

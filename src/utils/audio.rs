@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Channels, SampleRate};
 
 /// Параметры аудио для Opus
-pub const OPUS_SAMPLE_RATE: SampleRate = SampleRate::Hz48000;
+pub const OPUS_SAMPLE_RATE: SampleRate = SampleRate::Hz24000;
 pub const OPUS_CHANNELS: Channels = Channels::Mono;
 pub const OPUS_FRAME_SIZE_MS: i32 = 20; // 20ms frames
 pub const OPUS_FRAME_SIZE: usize = (OPUS_SAMPLE_RATE as usize * OPUS_FRAME_SIZE_MS as usize) / 1000; // 960 samples
