@@ -12,7 +12,7 @@ use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::services::{llm::ChatMessage, session::MessageDirection, Services};
+use crate::services::{llm::ChatMessage, session::MessageDirection, tts::SynthesizedAudio, Services};
 use crate::storage::Storage;
 use crate::websocket::audio::AudioProcessor;
 use crate::websocket::protocol::{AudioParams, Features, HelloMessage, Message};
@@ -736,7 +736,7 @@ async fn handle_listen_text(
     info!("Using audio format: {:?}", audio_format);
     let tts_audio = match services.tts.synthesize_with_format(&response, audio_format).await {
         Ok(audio) => {
-            info!("TTS audio synthesized: {} bytes", audio.len());
+            info!("TTS audio synthesized: {} bytes", audio.total_bytes());
             audio
         }
         Err(e) => {
@@ -746,33 +746,53 @@ async fn handle_listen_text(
         }
     };
 
-    info!("Sending TTS audio: {} bytes", tts_audio.len());
-    let tts_len = tts_audio.len();
-    match sender.send(WsMessage::Binary(tts_audio)).await {
-        Ok(_) => {
-            info!("TTS audio sent successfully");
-            if let Err(e) = sender.flush().await {
-                warn!("Failed to flush WebSocket after TTS audio (connection may be closed): {}", e);
+    info!("Sending TTS audio: {} bytes", tts_audio.total_bytes());
+    let audio_total = tts_audio.total_bytes();
+    let send_result = match tts_audio {
+        SynthesizedAudio::OpusFrames(frames) => {
+            info!("Sending {} Opus frames", frames.len());
+            for (idx, frame) in frames.into_iter().enumerate() {
+                if frame.is_empty() {
+                    continue;
+                }
+                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
+                    error!("Failed to send Opus frame {}: {}", idx, e);
+                    return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
+                }
             }
-            log_session_message(
-                &services.session,
-                Some(session_id),
-                MessageDirection::Outgoing,
-                "tts_audio",
-                &format!("{} bytes", tts_len),
-            )
-            .await;
+            sender.flush().await.map_err(|e| {
+                warn!(
+                    "Failed to flush WebSocket after Opus frames (connection may be closed): {}",
+                    e
+                );
+                e
+            }).ok();
+            Ok(())
         }
-        Err(e) => {
-            let error_msg = format!("{}", e);
-            if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
-                warn!("Client closed connection before TTS audio could be sent. This is normal if client disconnected.");
-                // Это нормально, если клиент отключился - просто логируем
-            } else {
-                error!("Failed to send TTS audio: {}", e);
-                return Err(anyhow::anyhow!("Failed to send TTS audio: {}", e));
-            }
+        SynthesizedAudio::Binary(data) => sender
+            .send(WsMessage::Binary(data))
+            .await
+            .map_err(|e| anyhow::anyhow!(e)),
+    };
+
+    if let Err(e) = send_result {
+        let error_msg = format!("{}", e);
+        if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
+            warn!("Client closed connection before TTS audio could be sent. This is normal if client disconnected.");
+        } else {
+            error!("Failed to send TTS audio: {}", error_msg);
+            return Err(e);
         }
+    } else {
+        info!("TTS audio sent successfully");
+        log_session_message(
+            &services.session,
+            Some(session_id),
+            MessageDirection::Outgoing,
+            "tts_audio",
+            &format!("{} bytes", audio_total),
+        )
+        .await;
     }
 
     Ok(())
@@ -895,7 +915,7 @@ async fn handle_stt_message(
     let audio_format = audio_format_option.as_deref();
     let tts_audio = match services.tts.synthesize_with_format(&response, audio_format).await {
         Ok(audio) => {
-            info!("TTS audio synthesized: {} bytes", audio.len());
+            info!("TTS audio synthesized: {} bytes", audio.total_bytes());
             audio
         }
         Err(e) => {
@@ -904,33 +924,54 @@ async fn handle_stt_message(
         }
     };
 
-    info!("Sending TTS audio: {} bytes", tts_audio.len());
-    let tts_len = tts_audio.len();
-    match sender.send(WsMessage::Binary(tts_audio)).await {
-        Ok(_) => {
-            info!("TTS audio sent successfully");
-            if let Err(e) = sender.flush().await {
-                warn!("Failed to flush WebSocket after TTS audio (connection may be closed): {}", e);
+    info!("Sending TTS audio: {} bytes", tts_audio.total_bytes());
+    let audio_total = tts_audio.total_bytes();
+    let send_result = match tts_audio {
+        SynthesizedAudio::OpusFrames(frames) => {
+            let frame_count = frames.len();
+            info!("Sending {} Opus frames", frame_count);
+            for (idx, frame) in frames.into_iter().enumerate() {
+                if frame.is_empty() {
+                    continue;
+                }
+                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
+                    error!("Failed to send Opus frame {}: {}", idx, e);
+                    return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
+                }
             }
-            log_session_message(
-                &services.session,
-                Some(session_id),
-                MessageDirection::Outgoing,
-                "tts_audio",
-                &format!("{} bytes", tts_len),
-            )
-            .await;
+            sender.flush().await.map_err(|e| {
+                warn!(
+                    "Failed to flush WebSocket after Opus frames (connection may be closed): {}",
+                    e
+                );
+                e
+            }).ok();
+            Ok(())
         }
-        Err(e) => {
-            let error_msg = format!("{}", e);
-            if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
-                warn!("Client closed connection before TTS audio could be sent. This is normal if client disconnected.");
-                // Это нормально, если клиент отключился - просто логируем
-            } else {
-                error!("Failed to send TTS audio: {}", e);
-                return Err(anyhow::anyhow!("Failed to send TTS audio: {}", e));
-            }
+        SynthesizedAudio::Binary(data) => sender
+            .send(WsMessage::Binary(data))
+            .await
+            .map_err(|e| anyhow::anyhow!(e)),
+    };
+
+    if let Err(e) = send_result {
+        let error_msg = format!("{}", e);
+        if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
+            warn!("Client closed connection before TTS audio could be sent. This is normal if client disconnected.");
+        } else {
+            error!("Failed to send TTS audio: {}", error_msg);
+            return Err(e);
         }
+    } else {
+        info!("TTS audio sent successfully");
+        log_session_message(
+            &services.session,
+            Some(session_id),
+            MessageDirection::Outgoing,
+            "tts_audio",
+            &format!("{} bytes", audio_total),
+        )
+        .await;
     }
 
     Ok(())
@@ -949,11 +990,27 @@ async fn handle_tts_request(
     let session = SESSION_MANAGER.get_session(session_id).await;
     let audio_format_option = session.and_then(|s| s.audio_format);
     let audio_format = audio_format_option.as_deref();
-    let opus_audio = services.tts.synthesize_with_format(text, audio_format).await?;
-    let audio_len = opus_audio.len();
+    let synthesized = services.tts.synthesize_with_format(text, audio_format).await?;
+    let audio_len = synthesized.total_bytes();
 
-    // Отправляем аудио
-    sender.send(WsMessage::Binary(opus_audio)).await?;
+    match synthesized {
+        SynthesizedAudio::OpusFrames(frames) => {
+            for (idx, frame) in frames.into_iter().enumerate() {
+                if frame.is_empty() {
+                    continue;
+                }
+                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
+                    return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
+                }
+            }
+            if let Err(e) = sender.flush().await {
+                warn!("Failed to flush WebSocket after Opus frames: {}", e);
+            }
+        }
+        SynthesizedAudio::Binary(data) => {
+            sender.send(WsMessage::Binary(data)).await?;
+        }
+    }
 
     log_session_message(
         &services.session,

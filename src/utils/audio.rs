@@ -36,10 +36,10 @@ impl AudioConverter {
         Ok(Self { encoder, decoder })
     }
 
-    /// Кодирует PCM аудио в Opus
-    pub fn encode_pcm_to_opus(&mut self, pcm_data: &[i16]) -> Result<Vec<u8>> {
+    /// Кодирует PCM аудио в Opus, возвращая отдельные кадры
+    pub fn encode_pcm_to_opus_frames(&mut self, pcm_data: &[i16]) -> Result<Vec<Vec<u8>>> {
         let frame_size = OPUS_FRAME_SIZE;
-        let mut encoded = Vec::new();
+        let mut frames = Vec::new();
 
         // Обрабатываем данные по кадрам
         for chunk in pcm_data.chunks(frame_size) {
@@ -55,9 +55,20 @@ impl AudioConverter {
                 .encode(&frame, &mut output)
                 .context("Failed to encode audio frame")?;
 
-            encoded.extend_from_slice(&output[..encoded_len]);
+            frames.push(output[..encoded_len].to_vec());
         }
 
+        Ok(frames)
+    }
+
+    /// Кодирует PCM аудио в Opus (как сплошной буфер)
+    pub fn encode_pcm_to_opus(&mut self, pcm_data: &[i16]) -> Result<Vec<u8>> {
+        let frames = self.encode_pcm_to_opus_frames(pcm_data)?;
+        let total_size: usize = frames.iter().map(|f| f.len()).sum();
+        let mut encoded = Vec::with_capacity(total_size);
+        for frame in frames {
+            encoded.extend_from_slice(&frame);
+        }
         Ok(encoded)
     }
 
@@ -150,6 +161,11 @@ impl AudioStreamProcessor {
     /// Кодирует PCM данные в Opus
     pub fn encode_to_opus(&mut self, pcm_data: &[i16]) -> Result<Vec<u8>> {
         self.converter.encode_pcm_to_opus(pcm_data)
+    }
+
+    /// Кодирует PCM данные в Opus кадры
+    pub fn encode_to_opus_frames(&mut self, pcm_data: &[i16]) -> Result<Vec<Vec<u8>>> {
+        self.converter.encode_pcm_to_opus_frames(pcm_data)
     }
 }
 

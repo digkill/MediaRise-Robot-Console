@@ -1,7 +1,7 @@
 //! Text-to-Speech сервис
 
 use anyhow::Context;
-use tracing::{error, info, instrument};
+use tracing::{info, instrument};
 
 use crate::config::TtsConfig;
 use crate::utils::audio::{utils, AudioStreamProcessor};
@@ -22,6 +22,23 @@ pub struct TtsService {
     client: reqwest::Client,
 }
 
+#[derive(Debug)]
+pub enum SynthesizedAudio {
+    /// Набор Opus кадров (каждый кадр = отдельный WebSocket пакет)
+    OpusFrames(Vec<Vec<u8>>),
+    /// Любой другой бинарный формат (MP3 и т.д.)
+    Binary(Vec<u8>),
+}
+
+impl SynthesizedAudio {
+    pub fn total_bytes(&self) -> usize {
+        match self {
+            SynthesizedAudio::OpusFrames(frames) => frames.iter().map(|f| f.len()).sum(),
+            SynthesizedAudio::Binary(data) => data.len(),
+        }
+    }
+}
+
 impl TtsService {
     pub fn new(config: &TtsConfig) -> anyhow::Result<Self> {
         Ok(Self {
@@ -31,7 +48,7 @@ impl TtsService {
     }
 
     #[instrument(skip_all, fields(chars = text.len(), provider = %self.config.provider, format = ?self.config.audio_format))]
-    pub async fn synthesize(&self, text: &str) -> anyhow::Result<Vec<u8>> {
+    pub async fn synthesize(&self, text: &str) -> anyhow::Result<SynthesizedAudio> {
         self.synthesize_with_format(text, None).await
     }
 
@@ -40,7 +57,7 @@ impl TtsService {
         &self,
         text: &str,
         format_override: Option<&str>,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<SynthesizedAudio> {
         let audio_format = format_override
             .and_then(|f| match f.to_lowercase().as_str() {
                 "mp3" => Some(crate::config::AudioFormat::Mp3),
@@ -66,7 +83,7 @@ impl TtsService {
     }
 
     #[instrument(skip_all, fields(chars = text.len()))]
-    async fn synthesize_openai(&self, text: &str) -> anyhow::Result<Vec<u8>> {
+    async fn synthesize_openai(&self, text: &str) -> anyhow::Result<SynthesizedAudio> {
         self.synthesize_openai_with_format(text, &self.config.audio_format).await
     }
 
@@ -75,7 +92,7 @@ impl TtsService {
         &self,
         text: &str,
         audio_format: &crate::config::AudioFormat,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<SynthesizedAudio> {
         let api_url = self.config.api_url.as_deref().unwrap_or(OPENAI_API_BASE);
         let endpoint = build_endpoint(api_url);
 
@@ -130,18 +147,23 @@ impl TtsService {
 
             let mut processor =
                 AudioStreamProcessor::new().context("Failed to create audio processor")?;
-            let opus_audio = processor
-                .encode_to_opus(&pcm_samples)
+            let opus_frames = processor
+                .encode_to_opus_frames(&pcm_samples)
                 .context("Failed to encode PCM to Opus")?;
+            let total_bytes: usize = opus_frames.iter().map(|f| f.len()).sum();
 
-            info!("Converted to Opus: {} bytes", opus_audio.len());
-            Ok(opus_audio)
+            info!(
+                "Converted to Opus: {} frames ({} bytes)",
+                opus_frames.len(),
+                total_bytes
+            );
+            Ok(SynthesizedAudio::OpusFrames(opus_frames))
         } else {
             // Возвращаем MP3 напрямую
             info!("Received TTS audio: {} bytes (MP3), first bytes: {:02x?}", 
                 audio_data.len(), 
                 &audio_data[..audio_data.len().min(10)]);
-            Ok(audio_data)
+            Ok(SynthesizedAudio::Binary(audio_data))
         }
     }
 }
