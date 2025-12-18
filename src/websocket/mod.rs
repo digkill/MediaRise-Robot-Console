@@ -983,7 +983,11 @@ async fn send_tts_audio(
         text: None,
     });
     if let Ok(json) = serde_json::to_string(&start) {
-        let _ = sender.send(WsMessage::Text(json)).await;
+        if let Err(e) = sender.send(WsMessage::Text(json)).await {
+            warn!("Failed to send tts:start: {}", e);
+        } else {
+            let _ = sender.flush().await;
+        }
     }
 
     match synthesized {
@@ -1012,8 +1016,11 @@ async fn send_tts_audio(
         text: None,
     });
     if let Ok(json) = serde_json::to_string(&stop) {
-        let _ = sender.send(WsMessage::Text(json)).await;
-        let _ = sender.flush().await;
+        if let Err(e) = sender.send(WsMessage::Text(json)).await {
+            warn!("Failed to send tts:stop: {}", e);
+        } else {
+            let _ = sender.flush().await;
+        }
     }
 
     Ok(())
