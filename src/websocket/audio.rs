@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_aec_buffer() {
-        let mut aec = AecBuffer::new(200, 48000);
+        let mut aec = AecBuffer::new(200, OPUS_SAMPLE_RATE as u32);
 
         // Добавляем воспроизводимый сигнал
         let playback: Vec<i16> = (0..1000).map(|i| (i % 1000) as i16).collect();

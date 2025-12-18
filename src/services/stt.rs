@@ -4,7 +4,7 @@ use anyhow::Context;
 use tracing::{error, info, instrument, warn};
 
 use crate::config::SttConfig;
-use crate::utils::audio::utils;
+use crate::utils::audio::{utils, OPUS_SAMPLE_RATE};
 
 const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 
@@ -50,6 +50,17 @@ impl SttService {
         }
     }
 
+    #[instrument(skip_all, fields(samples = pcm_samples.len(), sample_rate = sample_rate, channels = channels))]
+    pub async fn transcribe_pcm(
+        &self,
+        pcm_samples: &[i16],
+        sample_rate: u32,
+        channels: u16,
+    ) -> anyhow::Result<String> {
+        let wav = utils::pcm_to_wav(pcm_samples, sample_rate, channels);
+        self.transcribe(&wav).await
+    }
+
     #[instrument(skip_all, fields(bytes = audio_data.len()))]
     async fn transcribe_openai(&self, audio_data: &[u8]) -> anyhow::Result<String> {
         let api_url = self.config.api_url.as_deref().unwrap_or(OPENAI_API_BASE);
@@ -92,16 +103,19 @@ impl SttService {
             (audio_data.to_vec(), "audio.mp3", "audio/mpeg")
         } else {
             // Сырые PCM байты - конвертируем в WAV
-            // Предполагаем стандартные параметры: 48kHz, моно, 16-bit
-            info!("Converting raw PCM to WAV format (assuming 48kHz, mono, 16-bit)");
+            // Предполагаем параметры Opus-пайплайна сервера (частота задаётся в заголовке WAV).
+            let assumed_rate = OPUS_SAMPLE_RATE as u32;
+            info!(
+                "Converting raw PCM to WAV format (assuming {}Hz, mono, 16-bit)",
+                assumed_rate
+            );
             
             // Конвертируем байты в PCM samples
             let pcm_samples = utils::bytes_to_pcm_samples(audio_data)
                 .context("Failed to convert bytes to PCM samples")?;
             
             // Конвертируем PCM samples в WAV файл
-            // Параметры: 48kHz (стандарт для Opus), моно (1 канал), 16-bit
-            let wav_data = utils::pcm_to_wav(&pcm_samples, 48000, 1);
+            let wav_data = utils::pcm_to_wav(&pcm_samples, assumed_rate, 1);
             
             info!("Converted PCM to WAV: {} bytes -> {} bytes", audio_data.len(), wav_data.len());
             (wav_data, "audio.wav", "audio/wav")

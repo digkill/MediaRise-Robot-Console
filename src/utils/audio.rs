@@ -7,7 +7,8 @@ use audiopus::{coder::Decoder, coder::Encoder, Channels, SampleRate};
 pub const OPUS_SAMPLE_RATE: SampleRate = SampleRate::Hz24000;
 pub const OPUS_CHANNELS: Channels = Channels::Mono;
 pub const OPUS_FRAME_SIZE_MS: i32 = 20; // 20ms frames
-pub const OPUS_FRAME_SIZE: usize = (OPUS_SAMPLE_RATE as usize * OPUS_FRAME_SIZE_MS as usize) / 1000; // 960 samples
+pub const OPUS_FRAME_SIZE: usize =
+    (OPUS_SAMPLE_RATE as usize * OPUS_FRAME_SIZE_MS as usize) / 1000; // 480 samples @ 24kHz
 
 /// Формат аудио
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +211,7 @@ pub mod utils {
     /// 
     /// Параметры:
     /// - samples: PCM сэмплы (i16, little-endian)
-    /// - sample_rate: частота дискретизации (обычно 48000 для Opus)
+    /// - sample_rate: частота дискретизации (обычно 24000 в текущем пайплайне)
     /// - channels: количество каналов (1 = моно, 2 = стерео)
     /// 
     /// Возвращает полный WAV файл как Vec<u8>

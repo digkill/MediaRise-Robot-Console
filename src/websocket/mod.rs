@@ -20,7 +20,10 @@ use crate::websocket::audio::AudioProcessor;
 use crate::websocket::protocol::{AudioParams, Features, HelloMessage, Message};
 use crate::websocket::session::{AudioParams as SessionAudioParams, SessionManager};
 
-const STREAMING_FRAME_DELAY_MS: u64 = 40;
+const SERVER_OPUS_SAMPLE_RATE: u32 = 24_000;
+const SERVER_OPUS_CHANNELS: u32 = 1;
+const SERVER_OPUS_FRAME_DURATION_MS: u32 = OPUS_FRAME_SIZE_MS as u32;
+const STREAMING_FRAME_DELAY_MS: u64 = SERVER_OPUS_FRAME_DURATION_MS as u64;
 
 // Глобальный менеджер сессий
 static SESSION_MANAGER: once_cell::sync::Lazy<Arc<SessionManager>> =
@@ -104,13 +107,19 @@ pub async fn handle_connection(
                     Ok(Message::Hello(hello)) => {
                         info!("Received hello message: {:?}", hello);
 
-                        // Создаем сессию
-                        let audio_params = hello.audio_params.unwrap_or(AudioParams {
+                        // Создаем/нормализуем аудио параметры.
+                        // Для ESP прошивки фиксируем Opus на 24 кГц, чтобы сервер и устройство были в одной частоте.
+                        let mut audio_params = hello.audio_params.unwrap_or(AudioParams {
                             format: "opus".to_string(),
-                            sample_rate: 48000,
-                            channels: 1,
-                            frame_duration: 20,
+                            sample_rate: SERVER_OPUS_SAMPLE_RATE,
+                            channels: SERVER_OPUS_CHANNELS,
+                            frame_duration: SERVER_OPUS_FRAME_DURATION_MS,
                         });
+                        if audio_params.format == "opus" {
+                            audio_params.sample_rate = SERVER_OPUS_SAMPLE_RATE;
+                            audio_params.channels = SERVER_OPUS_CHANNELS;
+                        }
+                        info!("Negotiated audio_params: {:?}", audio_params);
 
                         let session_audio_params = SessionAudioParams {
                             format: audio_params.format.clone(),
@@ -473,7 +482,7 @@ pub async fn handle_connection(
                             let sample_rate = session
                                 .as_ref()
                                 .map(|s| s.audio_params.sample_rate)
-                                .unwrap_or(48000); // Дефолт 48kHz
+                                .unwrap_or(SERVER_OPUS_SAMPLE_RATE); // Дефолт 24kHz
                             
                             // Добавляем samples в буфер и проверяем, готов ли он к отправке
                             let is_ready = SESSION_MANAGER
@@ -507,6 +516,7 @@ pub async fn handle_connection(
                                         &services,
                                         &session_id,
                                         &accumulated_samples,
+                                        sample_rate,
                                         &mut sender,
                                     )
                                     .await
@@ -637,6 +647,7 @@ pub async fn handle_connection(
                             &services,
                             &session_id,
                             &remaining_samples,
+                            SERVER_OPUS_SAMPLE_RATE,
                             &mut sender,
                         )
                         .await;
@@ -752,33 +763,7 @@ async fn handle_listen_text(
 
     info!("Sending TTS audio: {} bytes", tts_audio.total_bytes());
     let audio_total = tts_audio.total_bytes();
-    let send_result = match tts_audio {
-        SynthesizedAudio::OpusFrames(frames) => {
-            info!("Sending {} Opus frames", frames.len());
-            for (idx, frame) in frames.into_iter().enumerate() {
-                if frame.is_empty() {
-                    continue;
-                }
-                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
-                    error!("Failed to send Opus frame {}: {}", idx, e);
-                    return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
-                }
-                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
-            }
-            sender.flush().await.map_err(|e| {
-                warn!(
-                    "Failed to flush WebSocket after Opus frames (connection may be closed): {}",
-                    e
-                );
-                e
-            }).ok();
-            Ok(())
-        }
-        SynthesizedAudio::Binary(data) => sender
-            .send(WsMessage::Binary(data))
-            .await
-            .map_err(|e| anyhow::anyhow!(e)),
-    };
+    let send_result = send_tts_audio(sender, session_id, tts_audio).await;
 
     if let Err(e) = send_result {
         let error_msg = format!("{}", e);
@@ -931,34 +916,7 @@ async fn handle_stt_message(
 
     info!("Sending TTS audio: {} bytes", tts_audio.total_bytes());
     let audio_total = tts_audio.total_bytes();
-    let send_result = match tts_audio {
-        SynthesizedAudio::OpusFrames(frames) => {
-            let frame_count = frames.len();
-            info!("Sending {} Opus frames", frame_count);
-            for (idx, frame) in frames.into_iter().enumerate() {
-                if frame.is_empty() {
-                    continue;
-                }
-                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
-                    error!("Failed to send Opus frame {}: {}", idx, e);
-                    return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
-                }
-                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
-            }
-            sender.flush().await.map_err(|e| {
-                warn!(
-                    "Failed to flush WebSocket after Opus frames (connection may be closed): {}",
-                    e
-                );
-                e
-            }).ok();
-            Ok(())
-        }
-        SynthesizedAudio::Binary(data) => sender
-            .send(WsMessage::Binary(data))
-            .await
-            .map_err(|e| anyhow::anyhow!(e)),
-    };
+    let send_result = send_tts_audio(sender, session_id, tts_audio).await;
 
     if let Err(e) = send_result {
         let error_msg = format!("{}", e);
@@ -999,25 +957,7 @@ async fn handle_tts_request(
     let synthesized = services.tts.synthesize_with_format(text, audio_format).await?;
     let audio_len = synthesized.total_bytes();
 
-    match synthesized {
-        SynthesizedAudio::OpusFrames(frames) => {
-            for (idx, frame) in frames.into_iter().enumerate() {
-                if frame.is_empty() {
-                    continue;
-                }
-                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
-                    return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
-                }
-                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
-            }
-            if let Err(e) = sender.flush().await {
-                warn!("Failed to flush WebSocket after Opus frames: {}", e);
-            }
-        }
-        SynthesizedAudio::Binary(data) => {
-            sender.send(WsMessage::Binary(data)).await?;
-        }
-    }
+    send_tts_audio(sender, session_id, synthesized).await?;
 
     log_session_message(
         &services.session,
@@ -1027,6 +967,54 @@ async fn handle_tts_request(
         &format!("{} bytes", audio_len),
     )
     .await;
+
+    Ok(())
+}
+
+async fn send_tts_audio(
+    sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
+    session_id: &Uuid,
+    synthesized: SynthesizedAudio,
+) -> anyhow::Result<()> {
+    // Устройство может включать усилитель/кодек только после получения tts:start.
+    let start = Message::Tts(crate::websocket::protocol::TtsMessage {
+        session_id: session_id.to_string(),
+        state: "start".to_string(),
+        text: None,
+    });
+    if let Ok(json) = serde_json::to_string(&start) {
+        let _ = sender.send(WsMessage::Text(json)).await;
+    }
+
+    match synthesized {
+        SynthesizedAudio::OpusFrames(frames) => {
+            info!("Sending {} Opus frames (paced {}ms)", frames.len(), STREAMING_FRAME_DELAY_MS);
+            for (idx, frame) in frames.into_iter().enumerate() {
+                if frame.is_empty() {
+                    continue;
+                }
+                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
+                    return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
+                }
+                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
+            }
+            let _ = sender.flush().await;
+        }
+        SynthesizedAudio::Binary(data) => {
+            sender.send(WsMessage::Binary(data)).await?;
+            let _ = sender.flush().await;
+        }
+    }
+
+    let stop = Message::Tts(crate::websocket::protocol::TtsMessage {
+        session_id: session_id.to_string(),
+        state: "stop".to_string(),
+        text: None,
+    });
+    if let Ok(json) = serde_json::to_string(&stop) {
+        let _ = sender.send(WsMessage::Text(json)).await;
+        let _ = sender.flush().await;
+    }
 
     Ok(())
 }
@@ -1104,18 +1092,19 @@ async fn handle_audio_data(
     services: &Services,
     session_id: &Uuid,
     pcm_samples: &[i16],
+    sample_rate: u32,
     sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
 ) -> anyhow::Result<()> {
     info!("Handling audio data: {} PCM samples", pcm_samples.len());
 
-    // Конвертируем PCM в байты для STT
-    let pcm_bytes = crate::utils::audio::utils::pcm_samples_to_bytes(pcm_samples);
-
-    info!("Sending {} bytes to STT", pcm_bytes.len());
-    // Отправляем на STT
+    info!(
+        "Sending PCM to STT: samples={}, sample_rate={}Hz",
+        pcm_samples.len(),
+        sample_rate
+    );
     let text = services
         .stt
-        .transcribe(&pcm_bytes)
+        .transcribe_pcm(pcm_samples, sample_rate, 1)
         .await
         .context("STT transcription failed")?;
 
