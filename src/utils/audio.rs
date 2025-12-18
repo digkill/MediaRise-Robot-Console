@@ -1,55 +1,31 @@
-//! Аудио утилиты (совместимый API)
+//! Аудио утилиты
 
 use anyhow::{Context, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Channels, SampleRate};
-use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
 
-/// Opus всегда 48k
+/// Параметры аудио для Opus
 pub const OPUS_SAMPLE_RATE: SampleRate = SampleRate::Hz48000;
 pub const OPUS_CHANNELS: Channels = Channels::Mono;
+pub const OPUS_FRAME_SIZE_MS: i32 = 20; // 20ms frames
+pub const OPUS_FRAME_SIZE: usize = (OPUS_SAMPLE_RATE as usize * OPUS_FRAME_SIZE_MS as usize) / 1000; // 960 samples
 
-/// Длительность кадра (ms)
-pub const OPUS_FRAME_MS: usize = 20;
-
-/// 20ms @48k = 960 samples
-pub const OPUS_FRAME_SIZE: usize = (48_000 * OPUS_FRAME_MS) / 1000;
-
-/// Частота “устройства” для PCM (если хочешь 24k)
-pub const DEVICE_SAMPLE_RATE: usize = 24_000;
-pub const DEVICE_FRAME_SIZE: usize = (DEVICE_SAMPLE_RATE * OPUS_FRAME_MS) / 1000; // 480
-
-/// Формат аудио (вернули как ожидали сервисы)
+/// Формат аудио
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
     /// PCM 16-bit little-endian
     Pcm16,
-    /// Opus encoded (один пакет или length-delimited поток пакетов)
+    /// Opus encoded
     Opus,
 }
 
-/// Параметры sinc ресемплера (rubato 0.16.x не даёт Clone для SincInterpolationParameters)
-fn sinc_params() -> SincInterpolationParameters {
-    SincInterpolationParameters {
-        sinc_len: 128,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 160,
-        window: WindowFunction::BlackmanHarris2,
-    }
-}
-
-/// Конвертер аудио: PCM(24k) <-> Opus(48k)
+/// Конвертер аудио форматов
 pub struct AudioConverter {
     encoder: Encoder,
     decoder: Decoder,
-
-    up_24_to_48: SincFixedIn<f32>,
-    down_48_to_24: SincFixedIn<f32>,
 }
 
 impl AudioConverter {
+    /// Создает новый конвертер аудио
     pub fn new() -> Result<Self> {
         let encoder = Encoder::new(OPUS_SAMPLE_RATE, OPUS_CHANNELS, audiopus::Application::Voip)
             .context("Failed to create Opus encoder")?;
@@ -57,105 +33,64 @@ impl AudioConverter {
         let decoder = Decoder::new(OPUS_SAMPLE_RATE, OPUS_CHANNELS)
             .context("Failed to create Opus decoder")?;
 
-        let up_24_to_48 = SincFixedIn::<f32>::new(
-            48_000.0 / 24_000.0,
-            2.0,
-            sinc_params(),
-            DEVICE_FRAME_SIZE,
-            1,
-        )
-        .context("Failed to create resampler 24->48")?;
-
-        let down_48_to_24 = SincFixedIn::<f32>::new(
-            24_000.0 / 48_000.0,
-            2.0,
-            sinc_params(),
-            OPUS_FRAME_SIZE,
-            1,
-        )
-        .context("Failed to create resampler 48->24")?;
-
-        Ok(Self {
-            encoder,
-            decoder,
-            up_24_to_48,
-            down_48_to_24,
-        })
+        Ok(Self { encoder, decoder })
     }
 
-    /// PCM(24k) -> Vec<OpusPacket>
-    fn encode_pcm_to_opus_packets(&mut self, pcm_24k: &[i16]) -> Result<Vec<Vec<u8>>> {
-        let mut packets = Vec::new();
+    /// Кодирует PCM аудио в Opus
+    pub fn encode_pcm_to_opus(&mut self, pcm_data: &[i16]) -> Result<Vec<u8>> {
+        let frame_size = OPUS_FRAME_SIZE;
+        let mut encoded = Vec::new();
 
-        for chunk in pcm_24k.chunks(DEVICE_FRAME_SIZE) {
-            let mut frame_24 = vec![0i16; DEVICE_FRAME_SIZE];
-            frame_24[..chunk.len()].copy_from_slice(chunk);
+        // Обрабатываем данные по кадрам
+        for chunk in pcm_data.chunks(frame_size) {
+            // Дополняем последний чанк нулями, если он неполный
+            let mut frame = vec![0i16; frame_size];
+            let copy_len = chunk.len().min(frame_size);
+            frame[..copy_len].copy_from_slice(&chunk[..copy_len]);
 
-            // i16 -> f32 [-1..1]
-            let in_f32: Vec<f32> = frame_24
-                .iter()
-                .map(|&s| s as f32 / i16::MAX as f32)
-                .collect();
-
-            // 24k -> 48k
-            let out = self
-                .up_24_to_48
-                .process(&[in_f32], None)
-                .context("Resample 24->48 failed")?;
-            let out_48 = &out[0];
-
-            // f32 -> i16
-            let mut frame_48 = vec![0i16; out_48.len()];
-            for (i, &x) in out_48.iter().enumerate() {
-                let v = (x * i16::MAX as f32).round() as i32;
-                frame_48[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            }
-
-            // Opus encode
-            let mut output = vec![0u8; 4000];
+            // Кодируем кадр
+            let mut output = vec![0u8; 4000]; // Максимальный размер Opus кадра
             let encoded_len = self
                 .encoder
-                .encode(&frame_48, &mut output)
-                .context("Failed to encode Opus frame")?;
-            output.truncate(encoded_len);
+                .encode(&frame, &mut output)
+                .context("Failed to encode audio frame")?;
 
-            packets.push(output);
+            encoded.extend_from_slice(&output[..encoded_len]);
         }
 
-        Ok(packets)
+        Ok(encoded)
     }
 
-    /// Opus packet -> PCM(24k)
-    fn decode_opus_packet_to_pcm(&mut self, opus_packet: &[u8]) -> Result<Vec<i16>> {
-        // запас по размеру
-        let mut buffer_48 = vec![0i16; OPUS_FRAME_SIZE * 2];
+    /// Декодирует Opus аудио в PCM
+    pub fn decode_opus_to_pcm(&mut self, opus_data: &[u8]) -> Result<Vec<i16>> {
+        let frame_size = OPUS_FRAME_SIZE;
+        let mut decoded = Vec::new();
+        let mut buffer = vec![0i16; frame_size];
+
+        // Обрабатываем данные по кадрам
+        // Примечание: для реального использования нужно парсить Opus пакеты
+        // Здесь упрощенная версия, которая пытается декодировать весь буфер
         let decoded_len = self
             .decoder
-            .decode(Some(opus_packet), &mut buffer_48, false)
+            .decode(Some(opus_data), &mut buffer, false)
+            .context("Failed to decode audio frame")?;
+
+        decoded.extend_from_slice(&buffer[..decoded_len]);
+
+        Ok(decoded)
+    }
+
+    /// Декодирует Opus пакет в PCM
+    pub fn decode_opus_packet(&mut self, opus_packet: &[u8]) -> Result<Vec<i16>> {
+        let frame_size = OPUS_FRAME_SIZE;
+        let mut buffer = vec![0i16; frame_size];
+
+        let decoded_len = self
+            .decoder
+            .decode(Some(opus_packet), &mut buffer, false)
             .context("Failed to decode Opus packet")?;
-        buffer_48.truncate(decoded_len);
 
-        // i16 -> f32
-        let in_f32: Vec<f32> = buffer_48
-            .iter()
-            .map(|&s| s as f32 / i16::MAX as f32)
-            .collect();
-
-        // 48k -> 24k
-        let out = self
-            .down_48_to_24
-            .process(&[in_f32], None)
-            .context("Resample 48->24 failed")?;
-        let out_24 = &out[0];
-
-        // f32 -> i16
-        let mut pcm_24 = vec![0i16; out_24.len()];
-        for (i, &x) in out_24.iter().enumerate() {
-            let v = (x * i16::MAX as f32).round() as i32;
-            pcm_24[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        }
-
-        Ok(pcm_24)
+        Ok(buffer[..decoded_len].to_vec())
     }
 }
 
@@ -165,149 +100,259 @@ impl Default for AudioConverter {
     }
 }
 
-/// Обработчик аудио потоков (как ждут сервисы)
+/// Обработчик аудио потоков
 pub struct AudioStreamProcessor {
     converter: AudioConverter,
+    buffer: Vec<i16>,
 }
 
 impl AudioStreamProcessor {
+    /// Создает новый обработчик потоков
     pub fn new() -> Result<Self> {
         Ok(Self {
             converter: AudioConverter::new()?,
+            buffer: Vec::new(),
         })
     }
 
-    /// Старый контракт: вернуть Vec<u8>
-    /// - Для Pcm16: возвращаем length-delimited Opus stream: [u16 len][packet]...
-    /// - Для Opus: ожидаем один Opus packet и возвращаем PCM bytes
+    /// Обрабатывает входящий аудио поток
     pub fn process_stream(&mut self, data: &[u8], format: AudioFormat) -> Result<Vec<u8>> {
         match format {
             AudioFormat::Pcm16 => {
-                let samples = utils::bytes_to_pcm_samples(data)?;
-                let packets = self.converter.encode_pcm_to_opus_packets(&samples)?;
+                // Конвертируем байты в i16 samples
+                let samples: Vec<i16> = data
+                    .chunks_exact(2)
+                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
 
-                let mut out = Vec::new();
-                for p in packets {
-                    let len = p.len().min(u16::MAX as usize) as u16;
-                    out.extend_from_slice(&len.to_le_bytes());
-                    out.extend_from_slice(&p[..len as usize]);
-                }
-                Ok(out)
+                // Кодируем в Opus
+                self.converter.encode_pcm_to_opus(&samples)
             }
             AudioFormat::Opus => {
-                let pcm = self.converter.decode_opus_packet_to_pcm(data)?;
-                Ok(utils::pcm_samples_to_bytes(&pcm))
+                // Декодируем Opus в PCM
+                let pcm = self.converter.decode_opus_to_pcm(data)?;
+
+                // Конвертируем обратно в байты
+                let mut bytes = Vec::with_capacity(pcm.len() * 2);
+                for sample in pcm {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                Ok(bytes)
             }
         }
     }
 
-    /// Opus packet -> PCM(i16)
+    /// Обрабатывает Opus пакет и возвращает PCM
     pub fn process_opus_packet(&mut self, packet: &[u8]) -> Result<Vec<i16>> {
-        self.converter.decode_opus_packet_to_pcm(packet)
+        self.converter.decode_opus_packet(packet)
     }
 
-    /// PCM(i16, 24k) -> Opus (length-delimited stream as Vec<u8>)
+    /// Кодирует PCM данные в Opus
     pub fn encode_to_opus(&mut self, pcm_data: &[i16]) -> Result<Vec<u8>> {
-        let packets = self.converter.encode_pcm_to_opus_packets(pcm_data)?;
-        let mut out = Vec::new();
-        for p in packets {
-            let len = p.len().min(u16::MAX as usize) as u16;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&p[..len as usize]);
-        }
-        Ok(out)
+        self.converter.encode_pcm_to_opus(pcm_data)
     }
 }
 
 impl Default for AudioStreamProcessor {
     fn default() -> Self {
-        Self::new()
-            .expect("Failed to create audio stream processor")
+        Self::new().expect("Failed to create audio stream processor")
     }
 }
 
-/// Утилиты (как ждут imports crate::utils::audio::utils::...)
+/// Утилиты для работы с аудио
 pub mod utils {
     use super::*;
 
-    /// bytes (LE i16) -> Vec<i16>
+    /// Конвертирует байты в PCM samples (i16)
     pub fn bytes_to_pcm_samples(data: &[u8]) -> Result<Vec<i16>> {
         if data.len() % 2 != 0 {
             anyhow::bail!("PCM data must be even number of bytes");
         }
+
         Ok(data
             .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
             .collect())
     }
 
-    /// Vec<i16> -> bytes (LE i16)
+    /// Конвертирует PCM samples (i16) в байты
     pub fn pcm_samples_to_bytes(samples: &[i16]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(samples.len() * 2);
-        for &s in samples {
-            bytes.extend_from_slice(&s.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
         }
         bytes
     }
 
-    /// PCM -> WAV (RIFF) bytes
+    /// Конвертирует PCM samples в WAV файл с заголовком
+    /// 
+    /// WAV файл состоит из:
+    /// - RIFF заголовок (12 байт)
+    /// - fmt chunk (24 байта) - описание формата аудио
+    /// - data chunk заголовок (8 байт)
+    /// - PCM данные
+    /// 
+    /// Параметры:
+    /// - samples: PCM сэмплы (i16, little-endian)
+    /// - sample_rate: частота дискретизации (обычно 48000 для Opus)
+    /// - channels: количество каналов (1 = моно, 2 = стерео)
+    /// 
+    /// Возвращает полный WAV файл как Vec<u8>
     pub fn pcm_to_wav(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
         let pcm_data = pcm_samples_to_bytes(samples);
         let data_size = pcm_data.len() as u32;
-
-        // file_size = 36 + data_size (без первых 8 байт RIFF)
+        
+        // Размер файла минус 8 байт (RIFF и размер)
         let file_size = 36 + data_size;
+        
+        // Размер fmt chunk (16 байт данных + 8 байт заголовка = 24 байта)
         let fmt_size = 16u32;
-
+        
         let mut wav = Vec::with_capacity(44 + pcm_data.len());
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt chunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&fmt_size.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        
+        // RIFF заголовок (12 байт)
+        wav.extend_from_slice(b"RIFF");                    // Chunk ID
+        wav.extend_from_slice(&file_size.to_le_bytes());   // Chunk size
+        wav.extend_from_slice(b"WAVE");                    // Format
+        
+        // fmt chunk (24 байта)
+        wav.extend_from_slice(b"fmt ");                    // Subchunk1ID
+        wav.extend_from_slice(&fmt_size.to_le_bytes());     // Subchunk1Size (16)
+        wav.extend_from_slice(&1u16.to_le_bytes());         // AudioFormat (1 = PCM)
+        wav.extend_from_slice(&channels.to_le_bytes());     // NumChannels
+        wav.extend_from_slice(&sample_rate.to_le_bytes());  // SampleRate
         wav.extend_from_slice(&(sample_rate * channels as u32 * 2).to_le_bytes()); // ByteRate
         wav.extend_from_slice(&(channels * 2).to_le_bytes()); // BlockAlign
-        wav.extend_from_slice(&16u16.to_le_bytes()); // BitsPerSample
-
-        // data chunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(&pcm_data);
-
+        wav.extend_from_slice(&16u16.to_le_bytes());        // BitsPerSample (16-bit)
+        
+        // data chunk заголовок + данные (8 байт заголовка + данные)
+        wav.extend_from_slice(b"data");                    // Subchunk2ID
+        wav.extend_from_slice(&data_size.to_le_bytes());     // Subchunk2Size
+        wav.extend_from_slice(&pcm_data);                  // PCM данные
+        
         wav
     }
 
-    /// Apply gain in dB
-    pub fn apply_gain(samples: &mut [i16], gain_db: f32) {
-        let gain_linear = 10.0_f32.powf(gain_db / 20.0);
-        for s in samples.iter_mut() {
-            let v = (*s as f32 * gain_linear) as i32;
-            *s = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    /// Нормализует аудио данные (приводит к диапазону -1.0..1.0)
+    pub fn normalize_audio(samples: &mut [i16]) {
+        let max_amplitude = samples.iter().map(|&s| s.abs() as u16).max().unwrap_or(1) as f32;
+
+        if max_amplitude > 0.0 {
+            let scale = (i16::MAX as f32) / max_amplitude;
+            for sample in samples.iter_mut() {
+                *sample = (*sample as f32 * scale.min(1.0)) as i16;
+            }
         }
     }
 
-    /// RMS
+    /// Применяет гейн к аудио данным
+    pub fn apply_gain(samples: &mut [i16], gain_db: f32) {
+        let gain_linear = 10.0_f32.powf(gain_db / 20.0);
+        for sample in samples.iter_mut() {
+            let value = (*sample as f32 * gain_linear) as i32;
+            *sample = value.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        }
+    }
+
+    /// Обрезает тишину в начале и конце аудио
+    pub fn trim_silence(samples: &[i16], threshold: i16) -> Vec<i16> {
+        let start = samples
+            .iter()
+            .position(|&s| s.abs() > threshold)
+            .unwrap_or(0);
+
+        let end = samples
+            .iter()
+            .rposition(|&s| s.abs() > threshold)
+            .map(|pos| pos + 1)
+            .unwrap_or(samples.len());
+
+        samples[start..end].to_vec()
+    }
+
+    /// Вычисляет RMS (Root Mean Square) для аудио данных
     pub fn calculate_rms(samples: &[i16]) -> f32 {
         if samples.is_empty() {
             return 0.0;
         }
-        let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
-        (sum_sq / samples.len() as f64).sqrt() as f32
+
+        let sum_squares: f64 = samples.iter().map(|&s| (s as f64).powi(2)).sum();
+
+        (sum_squares / samples.len() as f64).sqrt() as f32
     }
 
-    /// dBFS (optional)
+    /// Вычисляет уровень громкости в дБ
     pub fn calculate_db_level(samples: &[i16]) -> f32 {
         let rms = calculate_rms(samples);
         if rms <= 0.0 {
             return f32::NEG_INFINITY;
         }
         20.0 * (rms / i16::MAX as f32).log10()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_converter_creation() {
+        let converter = AudioConverter::new();
+        assert!(converter.is_ok());
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let mut converter = AudioConverter::new().unwrap();
+
+        // Создаем тестовый PCM сигнал (синусоида)
+        let sample_rate = OPUS_SAMPLE_RATE as usize;
+        let duration_ms = 100;
+        let samples_count = (sample_rate * duration_ms) / 1000;
+        let frequency = 440.0; // A4 note
+
+        let mut pcm: Vec<i16> = (0..samples_count)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (f32::sin(2.0 * std::f32::consts::PI * frequency * t) * i16::MAX as f32) as i16
+            })
+            .collect();
+
+        // Кодируем
+        let encoded = converter.encode_pcm_to_opus(&pcm).unwrap();
+        assert!(!encoded.is_empty());
+
+        // Декодируем
+        let decoded = converter.decode_opus_to_pcm(&encoded).unwrap();
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_bytes_to_pcm_samples() {
+        let bytes = vec![0x00, 0x00, 0xFF, 0x7F, 0x00, 0x80];
+        let samples = utils::bytes_to_pcm_samples(&bytes).unwrap();
+        assert_eq!(samples, vec![0, 32767, -32768]);
+    }
+
+    #[test]
+    fn test_pcm_samples_to_bytes() {
+        let samples = vec![0, 32767, -32768];
+        let bytes = utils::pcm_samples_to_bytes(&samples);
+        assert_eq!(bytes.len(), 6);
+        assert_eq!(bytes[0..2], [0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_apply_gain() {
+        let mut samples = vec![1000i16, -1000i16];
+        utils::apply_gain(&mut samples, 6.0); // +6dB = удвоение амплитуды
+        assert!(samples[0].abs() > 1500);
+    }
+
+    #[test]
+    fn test_calculate_rms() {
+        let samples = vec![1000i16, -1000i16, 1000i16, -1000i16];
+        let rms = utils::calculate_rms(&samples);
+        assert!((rms - 1000.0).abs() < 1.0);
     }
 }
