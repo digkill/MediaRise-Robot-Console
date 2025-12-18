@@ -792,8 +792,22 @@ async fn handle_listen_text(
         }
         Err(e) => {
             error!("TTS synthesis error: {}", e);
-            // Не падаем, просто не отправляем аудио
-            return Err(e).context("TTS synthesis failed");
+            // Не рвём сессию: клиент уже получил текст LLM, просто сообщим что TTS не удалось.
+            let mut err_text = format!("TTS error: {}", e);
+            // Ограничиваем длину, чтобы не засорять UI/логи на устройстве.
+            if err_text.len() > 200 {
+                err_text.truncate(200);
+            }
+            let msg = Message::Tts(crate::websocket::protocol::TtsMessage {
+                session_id: session_id.to_string(),
+                state: "error".to_string(),
+                text: Some(err_text),
+            });
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = sender.send(WsMessage::Text(json)).await;
+                let _ = sender.flush().await;
+            }
+            return Ok(());
         }
     };
 
@@ -960,7 +974,20 @@ async fn handle_stt_message(
         }
         Err(e) => {
             error!("TTS synthesis error: {}", e);
-            return Err(e).context("TTS synthesis failed");
+            let mut err_text = format!("TTS error: {}", e);
+            if err_text.len() > 200 {
+                err_text.truncate(200);
+            }
+            let msg = Message::Tts(crate::websocket::protocol::TtsMessage {
+                session_id: session_id.to_string(),
+                state: "error".to_string(),
+                text: Some(err_text),
+            });
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = sender.send(WsMessage::Text(json)).await;
+                let _ = sender.flush().await;
+            }
+            return Ok(());
         }
     };
 

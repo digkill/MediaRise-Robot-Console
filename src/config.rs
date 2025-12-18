@@ -146,6 +146,8 @@ pub struct TtsConfig {
     pub api_url: Option<String>,
     /// API ключ для доступа к TTS сервису
     pub api_key: Option<String>,
+    /// Модель TTS (например, "tts-1" или "gpt-4o-mini-tts")
+    pub model: String,
     /// Голос для синтеза речи
     /// OpenAI поддерживает: "alloy", "echo", "fable", "onyx", "nova", "shimmer"
     /// Каждый голос звучит по-разному
@@ -308,6 +310,11 @@ impl Config {
         if let Ok(key) = std::env::var("TTS_API_KEY") {
             cfg.tts.api_key = Some(key);
         }
+        if let Ok(model) = std::env::var("TTS_MODEL") {
+            if !model.trim().is_empty() {
+                cfg.tts.model = model.trim().to_string();
+            }
+        }
         if let Ok(voice) = std::env::var("TTS_VOICE") {
             cfg.tts.voice = voice;
         }
@@ -411,6 +418,7 @@ impl Default for Config {
                 provider: "openai".to_string(),
                 api_url: Some(OPENAI_API_BASE.to_string()),
                 api_key: None,
+                model: "tts-1".to_string(),
                 voice: "alloy".to_string(),
                 audio_format: AudioFormat::Opus,
             },

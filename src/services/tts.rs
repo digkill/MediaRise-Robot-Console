@@ -109,7 +109,7 @@ impl TtsService {
         };
 
         let request_body = serde_json::json!({
-            "model": "tts-1",
+            "model": self.config.model,
             "input": text,
             "voice": self.config.voice,
             "response_format": response_format,
