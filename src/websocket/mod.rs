@@ -25,6 +25,33 @@ const SERVER_OPUS_CHANNELS: u32 = 1;
 const SERVER_OPUS_FRAME_DURATION_MS: u32 = OPUS_FRAME_SIZE_MS as u32;
 const STREAMING_FRAME_DELAY_MS: u64 = SERVER_OPUS_FRAME_DURATION_MS as u64;
 
+fn try_strip_bp3_header(data: &[u8]) -> (&[u8], bool) {
+    if data.len() < 4 {
+        return (data, false);
+    }
+    // BinaryProtocol3: { type:u8, reserved:u8, payload_size:u16(be), payload... }
+    if data[0] != 0 || data[1] != 0 {
+        return (data, false);
+    }
+    let payload_size = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if payload_size != data.len() - 4 {
+        return (data, false);
+    }
+    (&data[4..], true)
+}
+
+fn frame_bp3(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if payload.len() > (u16::MAX as usize) {
+        anyhow::bail!("Opus frame too large for BP3 header: {} bytes", payload.len());
+    }
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.push(0);
+    out.push(0);
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
 // Глобальный менеджер сессий
 static SESSION_MANAGER: once_cell::sync::Lazy<Arc<SessionManager>> =
     once_cell::sync::Lazy::new(|| Arc::new(SessionManager::new()));
@@ -468,12 +495,21 @@ pub async fn handle_connection(
                 }
             }
             Ok(WsMessage::Binary(data)) => {
-                info!("Received binary audio data: {} bytes", data.len());
+                let (payload, stripped_bp3) = try_strip_bp3_header(&data);
+                if stripped_bp3 {
+                    info!(
+                        "Received binary audio data: {} bytes (BP3 framed -> {} bytes payload)",
+                        data.len(),
+                        payload.len()
+                    );
+                } else {
+                    info!("Received binary audio data: {} bytes", data.len());
+                }
 
                 // Обрабатываем аудио данные
                 if let Some(ref mut processor) = audio_processor {
                     info!("Audio processor available, trying to decode audio...");
-                    match processor.process_incoming_audio(&data) {
+                    match processor.process_incoming_audio(payload) {
                         Ok(pcm_samples) => {
                             info!("Decoded audio to PCM: {} samples", pcm_samples.len());
                             
@@ -540,7 +576,7 @@ pub async fn handle_connection(
                             info!(
                                 "Trying to send raw audio to STT (may be WebM format from browser)"
                             );
-                            match handle_raw_audio(&services, &session_id, &data, &mut sender).await
+                            match handle_raw_audio(&services, &session_id, payload, &mut sender).await
                             {
                                 Ok(_) => {
                                     info!("Successfully processed raw audio");
@@ -847,9 +883,11 @@ async fn handle_stt_message(
             resp
         }
         Err(e) => {
+            // Важно: даже если LLM упал/нет ключа/лимит — всё равно отвечаем голосом,
+            // иначе на устройстве будет только ">> ..." и "нет звука".
             error!("LLM service error: {}", e);
-            error!("Error details: {:?}", e);
-            return Err(e).context("LLM service failed");
+            warn!("Falling back to direct TTS response");
+            format!("Я тебя услышал: {}", text)
         }
     };
 
@@ -899,6 +937,18 @@ async fn handle_stt_message(
 
     // Отправляем TTS аудио
     info!("Synthesizing TTS for response: '{}'", response);
+
+    // Обновляем текст на экране устройства (оно показывает его через tts:sentence_start)
+    let sentence_start = Message::Tts(crate::websocket::protocol::TtsMessage {
+        session_id: session_id.to_string(),
+        state: "sentence_start".to_string(),
+        text: Some(response.clone()),
+    });
+    if let Ok(json) = serde_json::to_string(&sentence_start) {
+        let _ = sender.send(WsMessage::Text(json)).await;
+        let _ = sender.flush().await;
+    }
+
     // Получаем формат из сессии или используем из конфигурации
     let session = SESSION_MANAGER.get_session(session_id).await;
     let audio_format_option = session.and_then(|s| s.audio_format);
@@ -976,6 +1026,12 @@ async fn send_tts_audio(
     session_id: &Uuid,
     synthesized: SynthesizedAudio,
 ) -> anyhow::Result<()> {
+    let use_bp3 = SESSION_MANAGER
+        .get_session(session_id)
+        .await
+        .map(|s| s.protocol_version == 3)
+        .unwrap_or(false);
+
     // Устройство может включать усилитель/кодек только после получения tts:start.
     let start = Message::Tts(crate::websocket::protocol::TtsMessage {
         session_id: session_id.to_string(),
@@ -997,7 +1053,8 @@ async fn send_tts_audio(
                 if frame.is_empty() {
                     continue;
                 }
-                if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
+                let payload = if use_bp3 { frame_bp3(&frame)? } else { frame };
+                if let Err(e) = sender.send(WsMessage::Binary(payload)).await {
                     return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
                 }
                 sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
