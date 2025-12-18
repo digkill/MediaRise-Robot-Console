@@ -7,12 +7,14 @@ pub mod session;
 use anyhow::Context;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
+use tokio::time::{sleep, Duration};
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::services::{llm::ChatMessage, session::MessageDirection, tts::SynthesizedAudio, Services};
+use crate::utils::audio::OPUS_FRAME_SIZE_MS;
 use crate::storage::Storage;
 use crate::websocket::audio::AudioProcessor;
 use crate::websocket::protocol::{AudioParams, Features, HelloMessage, Message};
@@ -759,6 +761,7 @@ async fn handle_listen_text(
                     error!("Failed to send Opus frame {}: {}", idx, e);
                     return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
                 }
+                sleep(Duration::from_millis(OPUS_FRAME_SIZE_MS as u64)).await;
             }
             sender.flush().await.map_err(|e| {
                 warn!(
@@ -938,6 +941,7 @@ async fn handle_stt_message(
                     error!("Failed to send Opus frame {}: {}", idx, e);
                     return Err(anyhow::anyhow!("Failed to send Opus frame: {}", e));
                 }
+                sleep(Duration::from_millis(OPUS_FRAME_SIZE_MS as u64)).await;
             }
             sender.flush().await.map_err(|e| {
                 warn!(
@@ -1002,6 +1006,7 @@ async fn handle_tts_request(
                 if let Err(e) = sender.send(WsMessage::Binary(frame)).await {
                     return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
                 }
+                sleep(Duration::from_millis(OPUS_FRAME_SIZE_MS as u64)).await;
             }
             if let Err(e) = sender.flush().await {
                 warn!("Failed to flush WebSocket after Opus frames: {}", e);
