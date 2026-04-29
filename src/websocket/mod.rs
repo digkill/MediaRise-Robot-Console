@@ -9,7 +9,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
 use tokio::time::{sleep, Duration};
 use std::sync::Arc;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -24,6 +24,32 @@ const SERVER_OPUS_SAMPLE_RATE: u32 = 24_000;
 const SERVER_OPUS_CHANNELS: u32 = 1;
 const SERVER_OPUS_FRAME_DURATION_MS: u32 = OPUS_FRAME_SIZE_MS as u32;
 const STREAMING_FRAME_DELAY_MS: u64 = SERVER_OPUS_FRAME_DURATION_MS as u64;
+
+/// Первые байты полезной нагрузки для отладки (без дампа всего пакета).
+fn audio_hex_preview(data: &[u8], max: usize) -> String {
+    let n = data.len().min(max);
+    data[..n]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sniff_binary_audio_kind(data: &[u8]) -> &'static str {
+    if data.len() >= 4 && &data[0..4] == b"RIFF" {
+        "wav/riff"
+    } else if data.len() >= 4 && &data[0..4] == b"\x1a\x45\xdf\xa3" {
+        "webm/ebml"
+    } else if data.len() >= 3 && &data[0..3] == b"ID3" {
+        "mp3/id3"
+    } else if data.len() >= 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0 {
+        "mp3/sync"
+    } else if data.is_empty() {
+        "empty"
+    } else {
+        "unknown_or_opus"
+    }
+}
 
 fn try_strip_bp3_header(data: &[u8]) -> (&[u8], bool) {
     if data.len() < 4 {
@@ -498,20 +524,38 @@ pub async fn handle_connection(
                 let (payload, stripped_bp3) = try_strip_bp3_header(&data);
                 if stripped_bp3 {
                     info!(
-                        "Received binary audio data: {} bytes (BP3 framed -> {} bytes payload)",
-                        data.len(),
-                        payload.len()
+                        session_id = %session_id,
+                        wire_bytes = data.len(),
+                        payload_bytes = payload.len(),
+                        bp3 = true,
+                        payload_preview = %audio_hex_preview(payload, 16),
+                        sniff = sniff_binary_audio_kind(payload),
+                        "ws binary audio (BP3)"
                     );
                 } else {
-                    info!("Received binary audio data: {} bytes", data.len());
+                    info!(
+                        session_id = %session_id,
+                        wire_bytes = data.len(),
+                        bp3 = false,
+                        payload_preview = %audio_hex_preview(payload, 16),
+                        sniff = sniff_binary_audio_kind(payload),
+                        "ws binary audio"
+                    );
                 }
 
                 // Обрабатываем аудио данные
                 if let Some(ref mut processor) = audio_processor {
-                    info!("Audio processor available, trying to decode audio...");
+                    debug!(
+                        session_id = %session_id,
+                        "decode path: AudioProcessor (Opus -> PCM)"
+                    );
                     match processor.process_incoming_audio(payload) {
                         Ok(pcm_samples) => {
-                            info!("Decoded audio to PCM: {} samples", pcm_samples.len());
+                            debug!(
+                                session_id = %session_id,
+                                samples = pcm_samples.len(),
+                                "PCM chunk after decode"
+                            );
                             
                             // Получаем параметры сессии для определения sample_rate
                             let session = SESSION_MANAGER.get_session(&session_id).await;
@@ -530,10 +574,12 @@ pub async fn handle_connection(
                                 .await;
                             
                             info!(
-                                "Audio buffer: added {} samples, total: {:.2} seconds, ready: {}",
-                                pcm_samples.len(),
-                                buffer_duration,
-                                is_ready
+                                session_id = %session_id,
+                                added_samples = pcm_samples.len(),
+                                buffer_seconds = buffer_duration,
+                                sample_rate_hz = sample_rate,
+                                stt_ready = is_ready,
+                                "audio ring buffer"
                             );
                             
                             // Если буфер готов (накоплено >= 0.5 секунды), отправляем в STT
@@ -542,10 +588,14 @@ pub async fn handle_connection(
                                     .take_audio_samples(&session_id)
                                     .await
                                 {
+                                    let secs =
+                                        accumulated_samples.len() as f32 / sample_rate.max(1) as f32;
                                     info!(
-                                        "Buffer ready! Sending {} samples ({:.2} seconds) to STT",
-                                        accumulated_samples.len(),
-                                        accumulated_samples.len() as f32 / sample_rate as f32
+                                        session_id = %session_id,
+                                        samples = accumulated_samples.len(),
+                                        duration_sec = secs,
+                                        sample_rate_hz = sample_rate,
+                                        "STT: flushing buffered PCM"
                                     );
                                     
                                     if let Err(e) = handle_audio_data(
@@ -557,33 +607,53 @@ pub async fn handle_connection(
                                     )
                                     .await
                                     {
-                                        error!("Failed to handle audio: {}", e);
-                                        error!("Audio handling error details: {:?}", e);
+                                        error!(
+                                            session_id = %session_id,
+                                            "handle_audio_data failed: {:#}",
+                                            e
+                                        );
                                     }
                                 }
                             } else {
                                 // Буфер еще не готов - просто накапливаем
-                                info!(
-                                    "Buffer not ready yet: {:.2} seconds (need >= 0.5 seconds)",
-                                    buffer_duration
+                                debug!(
+                                    session_id = %session_id,
+                                    buffer_seconds = buffer_duration,
+                                    need_seconds = 0.5_f32,
+                                    "audio buffer below STT threshold"
                                 );
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to process audio through processor: {}", e);
-                            warn!("Error details: {:?}", e);
+                            warn!(
+                                session_id = %session_id,
+                                opus_or_payload_bytes = payload.len(),
+                                decode_error = %e,
+                                root_cause = ?e.root_cause(),
+                                payload_preview = %audio_hex_preview(payload, 24),
+                                sniff = sniff_binary_audio_kind(payload),
+                                "Opus decode failed; attempting raw-bytes STT fallback (часто даёт сбой для чистого Opus)"
+                            );
                             // Попробуем отправить напрямую на STT (может быть WebM от браузера)
                             info!(
-                                "Trying to send raw audio to STT (may be WebM format from browser)"
+                                session_id = %session_id,
+                                bytes = payload.len(),
+                                "raw STT fallback: send bytes as transcribe() input"
                             );
                             match handle_raw_audio(&services, &session_id, payload, &mut sender).await
                             {
                                 Ok(_) => {
-                                    info!("Successfully processed raw audio");
+                                    info!(
+                                        session_id = %session_id,
+                                        "raw STT fallback completed OK"
+                                    );
                                 }
                                 Err(e2) => {
-                                    error!("Failed to handle raw audio: {}", e2);
-                                    error!("Raw audio error details: {:?}", e2);
+                                    error!(
+                                        session_id = %session_id,
+                                        "raw STT fallback failed: {:#}",
+                                        e2
+                                    );
                                     // Отправляем сообщение об ошибке клиенту
                                     let error_msg = Message::System(
                                         crate::websocket::protocol::SystemMessage {
@@ -595,6 +665,11 @@ pub async fn handle_connection(
                                         },
                                     );
                                     if let Ok(json) = serde_json::to_string(&error_msg) {
+                                        warn!(
+                                            session_id = %session_id,
+                                            client_notice = %json,
+                                            "sending system error to device (ESP may log unknown command)"
+                                        );
                                         match sender
                                             .send(WsMessage::Text(json.clone()))
                                             .await
@@ -622,7 +697,11 @@ pub async fn handle_connection(
                         }
                     }
                 } else {
-                    info!("Audio processor not initialized, sending raw audio directly to STT");
+                    warn!(
+                        session_id = %session_id,
+                        wire_bytes = data.len(),
+                        "AudioProcessor missing: raw path only (check hello/audio_params init)"
+                    );
                     // Попробуем отправить напрямую на STT
                     match handle_raw_audio(&services, &session_id, &data, &mut sender).await {
                         Ok(_) => {
@@ -1186,20 +1265,35 @@ async fn handle_audio_data(
     sample_rate: u32,
     sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
 ) -> anyhow::Result<()> {
-    info!("Handling audio data: {} PCM samples", pcm_samples.len());
-
+    let duration_sec = pcm_samples.len() as f64 / sample_rate.max(1) as f64;
     info!(
-        "Sending PCM to STT: samples={}, sample_rate={}Hz",
-        pcm_samples.len(),
-        sample_rate
+        session_id = %session_id,
+        pcm_samples = pcm_samples.len(),
+        sample_rate_hz = sample_rate,
+        duration_sec = duration_sec,
+        "STT: transcribe_pcm (PCM -> WAV internally)"
     );
+
     let text = services
         .stt
         .transcribe_pcm(pcm_samples, sample_rate, 1)
         .await
-        .context("STT transcription failed")?;
+        .with_context(|| {
+            format!(
+                "STT transcription failed (session={}, samples={}, {:.3}s @ {}Hz)",
+                session_id,
+                pcm_samples.len(),
+                duration_sec,
+                sample_rate
+            )
+        })?;
 
-    info!("STT transcription result: '{}'", text);
+    info!(
+        session_id = %session_id,
+        transcript_len = text.len(),
+        "STT result"
+    );
+    debug!(session_id = %session_id, transcript = %text, "STT transcript text");
 
     if !text.is_empty() {
         // Обрабатываем через LLM и отправляем ответы
@@ -1220,41 +1314,58 @@ async fn handle_raw_audio(
     audio_data: &[u8],
     sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
 ) -> anyhow::Result<()> {
-    info!("=== Starting raw audio processing ===");
     info!(
-        "Audio data size: {} bytes (may be WebM/Opus from browser)",
-        audio_data.len()
+        session_id = %session_id,
+        bytes = audio_data.len(),
+        sniff = sniff_binary_audio_kind(audio_data),
+        preview = %audio_hex_preview(audio_data, 16),
+        "raw audio -> STT (no Opus decode on server)"
     );
 
-    // Отправляем сырые данные на STT (OpenAI Whisper поддерживает различные форматы)
-    info!("Sending audio to STT service...");
     let text = match services.stt.transcribe(audio_data).await {
         Ok(t) => {
-            info!("✅ STT transcription successful: '{}'", t);
+            info!(
+                session_id = %session_id,
+                transcript_len = t.len(),
+                "STT OK (raw path)"
+            );
+            debug!(session_id = %session_id, transcript = %t, "STT transcript (raw path)");
             t
         }
         Err(e) => {
-            error!("❌ STT transcription failed: {}", e);
-            error!("STT error details: {:?}", e);
+            error!(
+                session_id = %session_id,
+                "STT failed on raw audio: {:#}",
+                e
+            );
             return Err(e).context("STT transcription failed");
         }
     };
 
     if !text.is_empty() {
-        info!("Processing STT result through LLM pipeline...");
+        info!(
+            session_id = %session_id,
+            "LLM pipeline after STT (raw path)"
+        );
         // Обрабатываем через LLM и отправляем ответы
         match handle_stt_message(services, session_id, &text, sender).await {
             Ok(_) => {
-                info!("✅ Successfully processed STT result through LLM");
+                info!(session_id = %session_id, "LLM pipeline OK (raw path)");
             }
             Err(e) => {
-                error!("❌ Failed to process STT result: {}", e);
-                error!("LLM processing error details: {:?}", e);
+                error!(
+                    session_id = %session_id,
+                    "LLM after STT failed: {:#}",
+                    e
+                );
                 return Err(e).context("Failed to process STT result");
             }
         }
     } else {
-        warn!("⚠️ Empty transcription result from STT");
+        warn!(
+            session_id = %session_id,
+            "STT returned empty string (raw path)"
+        );
         // Отправляем сообщение клиенту о пустом результате
         let empty_msg = Message::System(crate::websocket::protocol::SystemMessage {
             session_id: session_id.to_string(),

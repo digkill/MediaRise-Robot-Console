@@ -1,7 +1,8 @@
 //! Speech-to-Text сервис
 
 use anyhow::Context;
-use tracing::{error, info, instrument, warn};
+use std::time::Instant;
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::SttConfig;
 use crate::utils::audio::{utils, OPUS_SAMPLE_RATE};
@@ -58,6 +59,15 @@ impl SttService {
         channels: u16,
     ) -> anyhow::Result<String> {
         let wav = utils::pcm_to_wav(pcm_samples, sample_rate, channels);
+        let pcm_duration = pcm_samples.len() as f64 / sample_rate.max(1) as f64;
+        debug!(
+            pcm_samples = pcm_samples.len(),
+            sample_rate_hz = sample_rate,
+            channels = channels,
+            pcm_duration_sec = pcm_duration,
+            wav_bytes = wav.len(),
+            "STT transcribe_pcm: built WAV for Whisper"
+        );
         self.transcribe(&wav).await
     }
 
@@ -71,6 +81,13 @@ impl SttService {
             .api_key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("STT API key not configured"))?;
+
+        debug!(
+            endpoint = %endpoint,
+            api_key_len = api_key.len(),
+            input_bytes = audio_data.len(),
+            "STT OpenAI: starting HTTP request"
+        );
 
         info!(
             "Sending audio to OpenAI Whisper API: {} bytes",
@@ -91,23 +108,27 @@ impl SttService {
         
         let (audio_file, file_name, mime_type) = if is_wav {
             // Уже WAV файл - используем как есть
-            info!("Audio is already in WAV format");
+            info!(
+                wav_bytes = audio_data.len(),
+                "STT input format: WAV (RIFF)"
+            );
             (audio_data.to_vec(), "audio.wav", "audio/wav")
         } else if is_webm {
             // WebM файл - используем как есть
-            info!("Audio is in WebM format");
+            info!(webm_bytes = audio_data.len(), "STT input format: WebM");
             (audio_data.to_vec(), "audio.webm", "audio/webm")
         } else if is_mp3 {
             // MP3 файл - используем как есть
-            info!("Audio is in MP3 format");
+            info!(mp3_bytes = audio_data.len(), "STT input format: MP3 (ID3)");
             (audio_data.to_vec(), "audio.mp3", "audio/mpeg")
         } else {
             // Сырые PCM байты - конвертируем в WAV
             // Предполагаем параметры Opus-пайплайна сервера (частота задаётся в заголовке WAV).
             let assumed_rate = OPUS_SAMPLE_RATE as u32;
-            info!(
-                "Converting raw PCM to WAV format (assuming {}Hz, mono, 16-bit)",
-                assumed_rate
+            warn!(
+                raw_bytes = audio_data.len(),
+                assumed_rate_hz = assumed_rate,
+                "STT input: treating payload as raw PCM16 LE (not RIFF/WebM/MP3) — verify client sends real PCM"
             );
             
             // Конвертируем байты в PCM samples
@@ -117,9 +138,15 @@ impl SttService {
             // Конвертируем PCM samples в WAV файл
             let wav_data = utils::pcm_to_wav(&pcm_samples, assumed_rate, 1);
             
-            info!("Converted PCM to WAV: {} bytes -> {} bytes", audio_data.len(), wav_data.len());
+            info!(
+                raw_pcm_bytes = audio_data.len(),
+                wav_bytes = wav_data.len(),
+                "converted assumed-PCM to WAV for STT"
+            );
             (wav_data, "audio.wav", "audio/wav")
         };
+
+        let upload_len = audio_file.len();
 
         // Создаем multipart форму для отправки
         let form = reqwest::multipart::Form::new()
@@ -131,6 +158,7 @@ impl SttService {
                     .mime_str(mime_type)?,
             );
 
+        let started = Instant::now();
         let response = self
             .client
             .post(&endpoint)
@@ -141,12 +169,35 @@ impl SttService {
             .context("Failed to send STT request to OpenAI")?;
 
         let status = response.status();
-        info!("OpenAI STT API response status: {}", status);
+        let req_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("openai-request-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let elapsed_ms = started.elapsed().as_millis();
+
+        info!(
+            status = %status,
+            elapsed_ms = elapsed_ms,
+            request_id = ?req_id,
+            file = file_name,
+            mime = mime_type,
+            upload_bytes = upload_len,
+            "OpenAI STT HTTP round-trip done"
+        );
 
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            error!("OpenAI STT API error: {} - {}", status, error_text);
-            anyhow::bail!("STT API error: {} - {}", status, error_text);
+            let trimmed = error_text.chars().take(900).collect::<String>();
+            error!(
+                status = %status,
+                elapsed_ms = elapsed_ms,
+                request_id = ?req_id,
+                body_prefix = %trimmed,
+                "OpenAI STT API error"
+            );
+            anyhow::bail!("STT API error: {} - {}", status, trimmed);
         }
 
         let result: serde_json::Value = response
@@ -154,14 +205,23 @@ impl SttService {
             .await
             .context("Failed to parse STT response from OpenAI")?;
 
-        info!("OpenAI STT response: {:?}", result);
+        debug!(
+            elapsed_ms = elapsed_ms,
+            response_keys = ?result.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()),
+            "OpenAI STT JSON body (keys)"
+        );
 
         let text = result["text"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No text in STT response"))?
             .to_string();
 
-        info!("✅ Transcribed text: '{}'", text);
+        info!(
+            elapsed_ms = elapsed_ms,
+            transcript_len = text.len(),
+            "STT transcribed successfully"
+        );
+        debug!(transcript = %text, "STT transcript");
         Ok(text)
     }
 }

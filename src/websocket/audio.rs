@@ -115,13 +115,23 @@ impl AudioProcessor {
 
     /// Обрабатывает входящий аудио поток (Opus -> PCM)
     pub fn process_incoming_audio(&mut self, data: &[u8]) -> Result<Vec<i16>> {
-        debug!("Processing incoming audio: {} bytes", data.len());
+        debug!(
+            bytes = data.len(),
+            sample_rate = self.params.sample_rate,
+            "incoming Opus packet"
+        );
 
         // Декодируем Opus в PCM
         let pcm_samples = self
             .stream_processor
             .process_opus_packet(data)
-            .context("Failed to decode Opus packet")?;
+            .with_context(|| {
+                format!(
+                    "Opus decode failed (packet {} bytes, expected {} Hz mono from client)",
+                    data.len(),
+                    self.params.sample_rate
+                )
+            })?;
 
         // Применяем гейн, если задан
         let mut processed_samples = pcm_samples;
@@ -133,6 +143,15 @@ impl AudioProcessor {
         if let Some(ref mut aec) = self.aec_buffer {
             aec.apply_aec(&mut processed_samples);
         }
+
+        let dur_ms =
+            (processed_samples.len() as u64).saturating_mul(1000) / self.params.sample_rate as u64;
+        info!(
+            opus_bytes = data.len(),
+            pcm_samples = processed_samples.len(),
+            duration_ms = dur_ms,
+            "decoded incoming audio"
+        );
 
         Ok(processed_samples)
     }

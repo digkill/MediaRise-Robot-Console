@@ -1,7 +1,8 @@
 //! Text-to-Speech сервис
 
 use anyhow::Context;
-use tracing::{info, instrument};
+use std::time::Instant;
+use tracing::{debug, error, info, instrument};
 
 use crate::config::TtsConfig;
 use crate::utils::audio::{utils, AudioStreamProcessor};
@@ -115,7 +116,16 @@ impl TtsService {
             "response_format": response_format,
         });
 
-        info!("Sending TTS request to {}", endpoint);
+        info!(
+            endpoint = %endpoint,
+            model = %self.config.model,
+            voice = %self.config.voice,
+            response_format,
+            input_chars = text.len(),
+            "TTS OpenAI: POST audio/speech"
+        );
+
+        let started = Instant::now();
         let response = self
             .client
             .post(&endpoint)
@@ -127,9 +137,37 @@ impl TtsService {
             .context("Failed to send TTS request")?;
 
         let status = response.status();
+        let req_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("openai-request-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        debug!(
+            status = %status,
+            elapsed_ms = started.elapsed().as_millis(),
+            request_id = ?req_id,
+            content_type = ?content_type,
+            "TTS HTTP response headers"
+        );
+
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("TTS API error: {} - {}", status, error_text);
+            let trimmed = error_text.chars().take(1000).collect::<String>();
+            error!(
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                request_id = ?req_id,
+                body_prefix = %trimmed,
+                "TTS API error"
+            );
+            anyhow::bail!("TTS API error: {} - {}", status, trimmed);
         }
 
         let audio_data = response
@@ -138,10 +176,23 @@ impl TtsService {
             .context("Failed to read TTS response")?
             .to_vec();
 
+        let elapsed_ms = started.elapsed().as_millis();
+        info!(
+            elapsed_ms,
+            request_id = ?req_id,
+            content_type = ?content_type,
+            audio_bytes = audio_data.len(),
+            convert_to_opus = convert_to_opus,
+            "TTS OpenAI: audio body received"
+        );
+
         if convert_to_opus {
             // Конвертируем PCM в Opus для отправки устройству
-            info!("Received TTS audio: {} bytes (PCM), converting to Opus", audio_data.len());
-            
+            debug!(
+                pcm_bytes = audio_data.len(),
+                "TTS: PCM from OpenAI, encoding to Opus frames"
+            );
+
             let pcm_samples = utils::bytes_to_pcm_samples(&audio_data)
                 .context("Failed to convert PCM bytes to samples")?;
 
@@ -153,16 +204,19 @@ impl TtsService {
             let total_bytes: usize = opus_frames.iter().map(|f| f.len()).sum();
 
             info!(
-                "Converted to Opus: {} frames ({} bytes)",
-                opus_frames.len(),
-                total_bytes
+                opus_frames = opus_frames.len(),
+                opus_payload_bytes = total_bytes,
+                "TTS: Opus frames ready for client"
             );
             Ok(SynthesizedAudio::OpusFrames(opus_frames))
         } else {
             // Возвращаем MP3 напрямую
-            info!("Received TTS audio: {} bytes (MP3), first bytes: {:02x?}", 
-                audio_data.len(), 
-                &audio_data[..audio_data.len().min(10)]);
+            let preview_len = audio_data.len().min(10);
+            debug!(
+                mp3_bytes = audio_data.len(),
+                first_bytes = ?&audio_data[..preview_len],
+                "TTS: MP3 from OpenAI"
+            );
             Ok(SynthesizedAudio::Binary(audio_data))
         }
     }

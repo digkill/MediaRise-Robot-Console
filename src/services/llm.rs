@@ -4,7 +4,8 @@ use anyhow::Context;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{error, info};
+use std::time::Instant;
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, GrokConfig, OpenAiLlmConfig};
 
@@ -32,11 +33,23 @@ struct Message {
 struct ChatCompletionsResponse {
     choices: Vec<Choice>,
     id: Option<String>,
+    /// Модель, фактически обработавшая запрос (часто приходит у OpenAI / xAI).
+    model: Option<String>,
+    /// Счётчики токенов (OpenAI-совместимый API).
+    usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Usage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
+    finish_reason: Option<String>,
 }
 
 impl LlmService {
@@ -139,8 +152,13 @@ impl LlmService {
         system_prompt: Option<&str>,
         messages: Vec<ChatMessage>,
     ) -> anyhow::Result<String> {
-        info!("Sending chat request to {} API: {}", provider_name, api_url);
-        info!("Model: {}, Incoming messages: {}", model, messages.len());
+        debug!(
+            provider = provider_name,
+            api_url = %api_url,
+            request_model = %model,
+            incoming_messages = messages.len(),
+            "LLM chat request (incoming)"
+        );
 
         let api_key = api_key
             .map(str::trim)
@@ -152,7 +170,7 @@ impl LlmService {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
-            info!("Applying system prompt");
+            debug!(provider = provider_name, "LLM: applying system prompt");
             payload_messages.push(Message {
                 role: "system".to_string(),
                 content: prompt.to_string(),
@@ -160,8 +178,14 @@ impl LlmService {
         }
 
         for m in messages.into_iter() {
-            let preview: String = m.content.chars().take(50).collect();
-            info!("Message: role={}, content={}...", m.role, preview);
+            let preview: String = m.content.chars().take(80).collect();
+            debug!(
+                provider = provider_name,
+                role = %m.role,
+                content_preview = %preview,
+                content_len = m.content.len(),
+                "LLM payload message"
+            );
             payload_messages.push(Message {
                 role: m.role,
                 content: m.content,
@@ -178,8 +202,17 @@ impl LlmService {
 
         let base = api_url.trim_end_matches('/');
         let url = format!("{}/chat/completions", base);
-        info!("POST {}", url);
+        info!(
+            provider = provider_name,
+            %url,
+            request_model = %model,
+            messages_out = request.messages.len(),
+            max_tokens,
+            temperature,
+            "LLM chat/completions POST"
+        );
 
+        let started = Instant::now();
         let response = self
             .client
             .post(&url)
@@ -191,24 +224,55 @@ impl LlmService {
             .with_context(|| format!("Failed to send request to {provider_name}"))?;
 
         let status = response.status();
-        info!("{} API response status: {}", provider_name, status);
+        let req_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("openai-request-id"))
+            .or_else(|| response.headers().get("x-correlation-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
 
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            error!("{} API error: {} - {}", provider_name, status, error_text);
-            anyhow::bail!("{} API error: {} - {}", provider_name, status, error_text);
-        }
-
-        let is_stream = response
+        let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        debug!(
+            provider = provider_name,
+            status = %status,
+            elapsed_ms = started.elapsed().as_millis(),
+            request_id = ?req_id,
+            content_type = ?content_type,
+            "LLM HTTP response headers"
+        );
+
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            let trimmed = error_text.chars().take(1200).collect::<String>();
+            error!(
+                provider = provider_name,
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                request_id = ?req_id,
+                body_prefix = %trimmed,
+                "LLM API error response"
+            );
+            anyhow::bail!("{} API error: {} - {}", provider_name, status, trimmed);
+        }
+
+        let is_stream = content_type
+            .as_deref()
             .map(|ct| ct.contains("text/event-stream"))
             .unwrap_or(false);
 
         if is_stream {
-            info!("Processing {} streaming response", provider_name);
-            return Self::read_streaming_response(response).await;
+            info!(
+                provider = provider_name,
+                request_id = ?req_id,
+                "LLM streaming response (SSE)"
+            );
+            return Self::read_streaming_response(provider_name, response, started).await;
         }
 
         let resp: ChatCompletionsResponse = response
@@ -216,12 +280,14 @@ impl LlmService {
             .await
             .with_context(|| format!("Failed to parse {provider_name} API response"))?;
 
-        info!(
-            "{} API response: {} choices (id={:?})",
-            provider_name,
-            resp.choices.len(),
-            resp.id
-        );
+        let elapsed_ms = started.elapsed().as_millis();
+        let finish_reason = resp
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.clone());
+        let usage_prompt = resp.usage.as_ref().and_then(|u| u.prompt_tokens);
+        let usage_completion = resp.usage.as_ref().and_then(|u| u.completion_tokens);
+        let usage_total = resp.usage.as_ref().and_then(|u| u.total_tokens);
 
         let content = resp
             .choices
@@ -229,21 +295,51 @@ impl LlmService {
             .map(|c| c.message.content.clone())
             .unwrap_or_default();
 
-        let preview: String = content.chars().take(100).collect();
-        info!("Extracted content: '{}'", preview);
+        if resp.choices.is_empty() {
+            warn!(
+                provider = provider_name,
+                elapsed_ms,
+                response_id = ?resp.id,
+                response_model = ?resp.model,
+                "LLM returned empty choices[]"
+            );
+        }
+
+        let preview: String = content.chars().take(160).collect();
+        info!(
+            provider = provider_name,
+            elapsed_ms,
+            request_id = ?req_id,
+            response_id = ?resp.id,
+            response_model = ?resp.model,
+            request_model = %model,
+            choices = resp.choices.len(),
+            finish_reason = ?finish_reason,
+            prompt_tokens = ?usage_prompt,
+            completion_tokens = ?usage_completion,
+            total_tokens = ?usage_total,
+            assistant_chars = content.len(),
+            assistant_preview = %preview,
+            "LLM JSON response parsed"
+        );
+        debug!(provider = provider_name, assistant_full = %content, "LLM assistant message (full)");
 
         Ok(content)
     }
 
-    async fn read_streaming_response(response: reqwest::Response) -> anyhow::Result<String> {
+    async fn read_streaming_response(
+        provider_name: &str,
+        response: reqwest::Response,
+        started: Instant,
+    ) -> anyhow::Result<String> {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut result = String::new();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Failed to read Grok stream chunk")?;
+            let chunk = chunk.context("Failed to read LLM SSE byte chunk")?;
             let text =
-                std::str::from_utf8(&chunk).context("Grok stream chunk is not valid UTF-8")?;
+                std::str::from_utf8(&chunk).context("LLM SSE chunk is not valid UTF-8")?;
             buffer.push_str(text);
 
             while let Some(idx) = buffer.find('\n') {
@@ -262,7 +358,17 @@ impl LlmService {
                 }
 
                 if payload == "[DONE]" {
-                    info!("Grok streaming completed");
+                    info!(
+                        provider = provider_name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        assembled_chars = result.len(),
+                        "LLM streaming completed ([DONE])"
+                    );
+                    debug!(
+                        provider = provider_name,
+                        assembled = %result,
+                        "LLM streaming assembled text"
+                    );
                     return Ok(result.trim().to_string());
                 }
 
@@ -279,6 +385,17 @@ impl LlmService {
             }
         }
 
+        info!(
+            provider = provider_name,
+            elapsed_ms = started.elapsed().as_millis(),
+            assembled_chars = result.len(),
+            "LLM streaming finished (end of stream, no [DONE])"
+        );
+        debug!(
+            provider = provider_name,
+            assembled = %result,
+            "LLM streaming assembled text"
+        );
         Ok(result.trim().to_string())
     }
 
@@ -287,8 +404,7 @@ impl LlmService {
             return Ok(None);
         }
 
-        let value: Value =
-            serde_json::from_str(payload).context("Failed to parse Grok streaming payload")?;
+        let value: Value = serde_json::from_str(payload).context("Failed to parse LLM SSE JSON chunk")?;
 
         if let Some(choices) = value.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {

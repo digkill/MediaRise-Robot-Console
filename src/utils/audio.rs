@@ -2,13 +2,18 @@
 
 use anyhow::{Context, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Channels, SampleRate};
+use tracing::debug;
 
 /// Параметры аудио для Opus
 pub const OPUS_SAMPLE_RATE: SampleRate = SampleRate::Hz24000;
 pub const OPUS_CHANNELS: Channels = Channels::Mono;
-pub const OPUS_FRAME_SIZE_MS: i32 = 20; // 20ms frames
+pub const OPUS_FRAME_SIZE_MS: i32 = 20; // 20ms frames (encoder / internal chunking)
 pub const OPUS_FRAME_SIZE: usize =
     (OPUS_SAMPLE_RATE as usize * OPUS_FRAME_SIZE_MS as usize) / 1000; // 480 samples @ 24kHz
+
+/// Max PCM samples per Opus decode at 24 kHz mono (120 ms — max standard Opus frame).
+/// Clients (e.g. xiaozhi ESP32) may send 60 ms frames (~1440 samples); a 480-sample buffer overflows audiopus.
+pub const OPUS_DECODE_MAX_SAMPLES: usize = (24000usize * 120) / 1000;
 
 /// Формат аудио
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +80,8 @@ impl AudioConverter {
 
     /// Декодирует Opus аудио в PCM
     pub fn decode_opus_to_pcm(&mut self, opus_data: &[u8]) -> Result<Vec<i16>> {
-        let frame_size = OPUS_FRAME_SIZE;
         let mut decoded = Vec::new();
-        let mut buffer = vec![0i16; frame_size];
+        let mut buffer = vec![0i16; OPUS_DECODE_MAX_SAMPLES];
 
         // Обрабатываем данные по кадрам
         // Примечание: для реального использования нужно парсить Opus пакеты
@@ -87,6 +91,12 @@ impl AudioConverter {
             .decode(Some(opus_data), &mut buffer, false)
             .context("Failed to decode audio frame")?;
 
+        debug!(
+            opus_bytes = opus_data.len(),
+            pcm_samples = decoded_len,
+            "Opus decode (aggregate buffer)"
+        );
+
         decoded.extend_from_slice(&buffer[..decoded_len]);
 
         Ok(decoded)
@@ -94,13 +104,19 @@ impl AudioConverter {
 
     /// Декодирует Opus пакет в PCM
     pub fn decode_opus_packet(&mut self, opus_packet: &[u8]) -> Result<Vec<i16>> {
-        let frame_size = OPUS_FRAME_SIZE;
-        let mut buffer = vec![0i16; frame_size];
+        let mut buffer = vec![0i16; OPUS_DECODE_MAX_SAMPLES];
 
         let decoded_len = self
             .decoder
             .decode(Some(opus_packet), &mut buffer, false)
             .context("Failed to decode Opus packet")?;
+
+        debug!(
+            opus_bytes = opus_packet.len(),
+            pcm_samples = decoded_len,
+            frame_ms_24khz = (decoded_len as u64 * 1000 / 24_000),
+            "Opus packet decoded to PCM"
+        );
 
         Ok(buffer[..decoded_len].to_vec())
     }
