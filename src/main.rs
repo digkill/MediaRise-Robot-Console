@@ -67,7 +67,15 @@ async fn main() -> Result<()> {
     // Выводим информацию о загруженной конфигурации
     // Это помогает убедиться, что все настройки загружены правильно
     info!(
-        "Configuration loaded: STT provider={}, url={:?}, key_present={}, TTS provider={}, url={:?}, key_present={}",
+        "Configuration loaded: LLM provider={}, grok_key_present={}, openai_llm_key_present={}, STT provider={}, url={:?}, key_present={}, TTS provider={}, url={:?}, key_present={}",
+        config.llm_provider,
+        !config.grok.api_key.is_empty(),
+        config
+            .openai_llm
+            .api_key
+            .as_ref()
+            .map(|k| !k.is_empty())
+            .unwrap_or(false),
         config.stt.provider,  // Провайдер STT (Speech-to-Text) - сервис для распознавания речи
         config.stt.api_url,  // URL API для STT
         // Проверяем, есть ли API ключ для STT (не пустой ли он)

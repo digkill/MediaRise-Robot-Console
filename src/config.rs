@@ -29,8 +29,12 @@ pub struct Config {
     pub server: ServerConfig,
     /// Настройки подключения к базе данных (SQLite, PostgreSQL, MySQL)
     pub database: DatabaseConfig,
+    /// Выбор LLM провайдера ("grok" или "openai")
+    pub llm_provider: String,
     /// Настройки для работы с Grok AI (языковая модель от xAI)
     pub grok: GrokConfig,
+    /// Настройки для работы с OpenAI Chat Completions (LLM)
+    pub openai_llm: OpenAiLlmConfig,
     /// Настройки для распознавания речи (STT - Speech-to-Text)
     pub stt: SttConfig,
     /// Настройки для синтеза речи (TTS - Text-to-Speech)
@@ -56,8 +60,39 @@ pub struct ServerConfig {
     pub host: String,
     /// Порт для HTTP запросов (обычно 8080)
     pub port: u16,
-    /// Порт для WebSocket соединений (обычно тот же, что и HTTP)
+    /// Устаревшее поле: WebSocket в этом сервисе обслуживается на том же порту, что и HTTP (`port`).
+    /// Оставлено для совместимости с WEBSOCKET_PORT в .env.
     pub websocket_port: u16,
+    /// Публичный hostname/IP для ответа OTA (устройство не может подключиться к 0.0.0.0).
+    /// Задаётся через PUBLIC_HOST.
+    pub public_host: Option<String>,
+    /// Полный базовый URL WebSocket для клиентов, например `ws://90.156.254.46:8080`.
+    /// Если задан, имеет приоритет над public_host/host. Переменная: WEBSOCKET_PUBLIC_URL.
+    pub websocket_public_url: Option<String>,
+}
+
+impl ServerConfig {
+    /// URL WebSocket для ответов OTA и логов: путь `/ws`, тот же TCP-порт, что и HTTP.
+    pub fn ota_websocket_url(&self) -> String {
+        if let Some(ref base) = self.websocket_public_url {
+            let b = base.trim().trim_end_matches('/');
+            return format!("{}/ws", b);
+        }
+        let host = self
+            .public_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .or_else(|| {
+                if self.host == "0.0.0.0" || self.host == "::" {
+                    None
+                } else {
+                    Some(self.host.as_str())
+                }
+            })
+            .unwrap_or("127.0.0.1");
+        format!("ws://{}:{}/ws", host, self.port)
+    }
 }
 
 /// Настройки подключения к базе данных
@@ -96,6 +131,23 @@ pub struct GrokConfig {
     /// Системный промпт - инструкции для AI о том, как себя вести
     /// Например: "You are a helpful assistant" или "You are Miko, a friendly robot"
     /// Option<String> означает, что это поле может быть None (не задано)
+    pub system_prompt: Option<String>,
+}
+
+/// Настройки для работы с OpenAI Chat Completions (LLM)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiLlmConfig {
+    /// API ключ для OpenAI
+    pub api_key: Option<String>,
+    /// URL API сервера OpenAI (обычно "https://api.openai.com/v1")
+    pub api_url: String,
+    /// Название модели (например, "gpt-4o-mini")
+    pub model: String,
+    /// Максимальное количество токенов в ответе
+    pub max_tokens: u32,
+    /// Температура генерации
+    pub temperature: f32,
+    /// Системный промпт
     pub system_prompt: Option<String>,
 }
 
@@ -248,12 +300,34 @@ impl Config {
             cfg.server.port = port.parse().unwrap_or(8080);
         }
         if let Ok(port) = std::env::var("WEBSOCKET_PORT") {
-            cfg.server.websocket_port = port.parse().unwrap_or(8081);
+            cfg.server.websocket_port = port.parse().unwrap_or(cfg.server.port);
+        } else {
+            // Один listener: HTTP и /ws на одном порту
+            cfg.server.websocket_port = cfg.server.port;
+        }
+        if let Ok(h) = std::env::var("PUBLIC_HOST") {
+            let h = h.trim().to_string();
+            if !h.is_empty() {
+                cfg.server.public_host = Some(h);
+            }
+        }
+        if let Ok(u) = std::env::var("WEBSOCKET_PUBLIC_URL") {
+            let u = u.trim().to_string();
+            if !u.is_empty() {
+                cfg.server.websocket_public_url = Some(u);
+            }
         }
 
         // Database configuration
         if let Ok(url) = std::env::var("DATABASE_URL") {
             cfg.database.url = url;
+        }
+
+        // LLM provider switch
+        if let Ok(provider) = std::env::var("LLM_PROVIDER") {
+            if !provider.trim().is_empty() {
+                cfg.llm_provider = provider.trim().to_string();
+            }
         }
 
         // Grok/LLM configuration
@@ -279,6 +353,42 @@ impl Config {
         if let Ok(prompt) = std::env::var("GROK_SYSTEM_PROMPT") {
             if !prompt.trim().is_empty() {
                 cfg.grok.system_prompt = Some(prompt);
+            }
+        }
+
+        // OpenAI LLM configuration
+        if let Ok(key) = std::env::var("OPENAI_LLM_API_KEY") {
+            if !key.trim().is_empty() {
+                cfg.openai_llm.api_key = Some(key.trim().to_string());
+            }
+        } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            if !key.trim().is_empty() {
+                cfg.openai_llm.api_key = Some(key.trim().to_string());
+            }
+        }
+        if let Ok(url) = std::env::var("OPENAI_LLM_API_URL") {
+            if !url.trim().is_empty() {
+                cfg.openai_llm.api_url = url.trim().to_string();
+            }
+        }
+        if let Ok(model) = std::env::var("OPENAI_LLM_MODEL") {
+            if !model.trim().is_empty() {
+                cfg.openai_llm.model = model.trim().to_string();
+            }
+        }
+        if let Ok(tokens) = std::env::var("OPENAI_LLM_MAX_TOKENS") {
+            if let Ok(val) = tokens.parse::<u32>() {
+                cfg.openai_llm.max_tokens = val;
+            }
+        }
+        if let Ok(temp) = std::env::var("OPENAI_LLM_TEMPERATURE") {
+            if let Ok(val) = temp.parse::<f32>() {
+                cfg.openai_llm.temperature = val;
+            }
+        }
+        if let Ok(prompt) = std::env::var("OPENAI_LLM_SYSTEM_PROMPT") {
+            if !prompt.trim().is_empty() {
+                cfg.openai_llm.system_prompt = Some(prompt);
             }
         }
 
@@ -342,6 +452,13 @@ impl Config {
                 cfg.tts.api_key = Some(key.clone());
             }
         }
+        if cfg.openai_llm.api_key.is_none() {
+            if let Some(ref key) = cfg.stt.api_key {
+                cfg.openai_llm.api_key = Some(key.clone());
+            } else if let Some(ref key) = cfg.tts.api_key {
+                cfg.openai_llm.api_key = Some(key.clone());
+            }
+        }
 
         // Storage configuration
         if let Ok(path) = std::env::var("STORAGE_BASE_PATH") {
@@ -394,11 +511,14 @@ impl Default for Config {
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
-                websocket_port: 8081,
+                websocket_port: 8080,
+                public_host: None,
+                websocket_public_url: None,
             },
             database: DatabaseConfig {
                 url: "sqlite:xiaozhi.db".to_string(),
             },
+            llm_provider: "grok".to_string(),
             grok: GrokConfig {
                 api_key: String::new(),
                 api_url: "https://api.x.ai/v1".to_string(),
@@ -408,6 +528,14 @@ impl Default for Config {
                 system_prompt: Some(
                     "You are Grok, a highly intelligent, helpful AI assistant.".to_string(),
                 ),
+            },
+            openai_llm: OpenAiLlmConfig {
+                api_key: None,
+                api_url: OPENAI_API_BASE.to_string(),
+                model: "gpt-4o-mini".to_string(),
+                max_tokens: 2048,
+                temperature: 0.7,
+                system_prompt: Some("You are a helpful AI assistant.".to_string()),
             },
             stt: SttConfig {
                 provider: "whisper".to_string(),

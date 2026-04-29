@@ -33,7 +33,7 @@ impl Services {
             audio: Arc::new(audio::AudioService::new()?),
             stt: Arc::new(stt::SttService::new(&config.stt)?),
             tts: Arc::new(tts::TtsService::new(&config.tts)?),
-            llm: Arc::new(llm::LlmService::new(&config.grok)?),
+            llm: Arc::new(llm::LlmService::new(config)?),
         })
     }
 }

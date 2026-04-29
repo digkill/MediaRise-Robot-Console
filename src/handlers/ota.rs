@@ -257,15 +257,23 @@ pub async fn check_version(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let ws_url = state.config.server.ota_websocket_url();
+    if state.config.server.websocket_public_url.is_none()
+        && state.config.server.public_host.is_none()
+        && (state.config.server.host == "0.0.0.0" || state.config.server.host == "::")
+    {
+        warn!(
+            "OTA will advertise websocket.url={} — set PUBLIC_HOST or WEBSOCKET_PUBLIC_URL so ESP32 can reach this server (not 127.0.0.1)",
+            ws_url
+        );
+    }
+
     let response = CheckVersionResponse {
         firmware,
         activation,
         mqtt,
         websocket: Some(WebSocketConfig {
-            url: format!(
-                "ws://{}:{}/ws",
-                state.config.server.host, state.config.server.websocket_port
-            ),
+            url: ws_url,
             token,
             version: 3,
         }),

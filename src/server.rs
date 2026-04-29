@@ -54,8 +54,8 @@ pub async fn start(config: Config, services: Services, storage: Storage) -> anyh
     // Выводим информацию о том, где запущен сервер
     info!("Server listening on http://{}", addr);
     info!(
-        "WebSocket endpoint: ws://{}:{}/ws",
-        config.server.host, config.server.port
+        "WebSocket endpoint for devices (OTA): {}",
+        config.server.ota_websocket_url()
     );
 
     // Создаем TCP listener - объект, который слушает входящие TCP соединения

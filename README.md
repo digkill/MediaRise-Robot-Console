@@ -10,7 +10,7 @@ Backend сервер на Rust для управления устройства�
 - ✅ WebSocket сервер для реального времени коммуникации
 - ✅ MQTT поддержка (опционально)
 - ✅ Обработка аудио (Opus encode/decode)
-- ✅ Интеграция с Grok API для LLM
+- ✅ Интеграция с Grok или OpenAI API для LLM (переключается через env)
 - ✅ STT/TTS интеграция
 - ✅ MCP (Model Context Protocol) сервер
 - ✅ Управление устройствами и сессиями
@@ -46,7 +46,7 @@ xiaozhi-backend/
 │   │   ├── audio.rs            # Обработка аудио
 │   │   ├── stt.rs              # Speech-to-Text
 │   │   ├── tts.rs              # Text-to-Speech
-│   │   └── llm.rs              # LLM (Grok)
+│   │   └── llm.rs              # LLM (Grok/OpenAI)
 │   ├── storage/                # Хранилище
 │   │   ├── mod.rs
 │   │   ├── database.rs         # База данных
@@ -104,11 +104,20 @@ DATABASE_URL=postgresql://user:password@localhost/xiaozhi
 # или для SQLite:
 # DATABASE_URL=sqlite:xiaozhi.db
 
-# Grok API
+# LLM
+# LLM_PROVIDER=grok|openai
+LLM_PROVIDER=grok
+
+# Grok (xAI)
 GROK_API_KEY=your_grok_api_key
 GROK_API_URL=https://api.x.ai/v1
 GROK_MODEL=grok-4
 GROK_SYSTEM_PROMPT=You are Grok, a highly intelligent, helpful AI assistant.
+
+# OpenAI LLM (если LLM_PROVIDER=openai)
+# OPENAI_LLM_API_KEY=your_key
+# OPENAI_LLM_API_URL=https://api.openai.com/v1
+# OPENAI_LLM_MODEL=gpt-4o-mini
 
 # STT/TTS (настройте по необходимости)
 STT_PROVIDER=whisper

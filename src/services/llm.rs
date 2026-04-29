@@ -1,4 +1,4 @@
-//! LLM сервис (Grok)
+//! LLM сервис (Grok или OpenAI)
 
 use anyhow::Context;
 use futures::StreamExt;
@@ -6,15 +6,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{error, info};
 
-use crate::config::GrokConfig;
+use crate::config::{Config, GrokConfig, OpenAiLlmConfig};
 
 pub struct LlmService {
-    config: GrokConfig,
+    provider: LlmProvider,
     client: reqwest::Client,
 }
 
 #[derive(Debug, Serialize)]
-struct GrokRequest {
+struct ChatCompletionsRequest {
     model: String,
     messages: Vec<Message>,
     max_tokens: u32,
@@ -29,7 +29,7 @@ struct Message {
 }
 
 #[derive(Debug, Deserialize)]
-struct GrokResponse {
+struct ChatCompletionsResponse {
     choices: Vec<Choice>,
     id: Option<String>,
 }
@@ -40,39 +40,116 @@ struct Choice {
 }
 
 impl LlmService {
-    pub fn new(config: &GrokConfig) -> anyhow::Result<Self> {
+    pub fn new(config: &Config) -> anyhow::Result<Self> {
         Ok(Self {
-            config: config.clone(),
+            provider: LlmProvider::from_config(config)?,
+            client: reqwest::Client::new(),
+        })
+    }
+
+    pub fn new_grok(config: &GrokConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            provider: LlmProvider::Grok(config.clone()),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    pub fn new_openai(config: &OpenAiLlmConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            provider: LlmProvider::OpenAi(config.clone()),
             client: reqwest::Client::new(),
         })
     }
 
     /// Создает новый сервис с кастомным HTTP клиентом (для тестирования)
-    pub fn new_with_client(config: &GrokConfig, client: reqwest::Client) -> Self {
+    pub fn new_grok_with_client(config: &GrokConfig, client: reqwest::Client) -> Self {
         Self {
-            config: config.clone(),
+            provider: LlmProvider::Grok(config.clone()),
+            client,
+        }
+    }
+
+    /// Создает новый сервис с кастомным HTTP клиентом (для тестирования)
+    pub fn new_openai_with_client(config: &OpenAiLlmConfig, client: reqwest::Client) -> Self {
+        Self {
+            provider: LlmProvider::OpenAi(config.clone()),
             client,
         }
     }
 
     pub async fn chat(&self, messages: Vec<ChatMessage>) -> anyhow::Result<String> {
-        info!("Sending chat request to Grok API: {}", self.config.api_url);
-        info!(
-            "Model: {}, Incoming messages: {}",
-            self.config.model,
-            messages.len()
-        );
+        match &self.provider {
+            LlmProvider::Grok(cfg) => self.chat_grok(cfg, messages).await,
+            LlmProvider::OpenAi(cfg) => self.chat_openai(cfg, messages).await,
+        }
+    }
 
-        if self.config.api_key.is_empty() {
-            anyhow::bail!("Grok API key is not configured. Set GROK_API_KEY environment variable.");
+    async fn chat_grok(&self, config: &GrokConfig, messages: Vec<ChatMessage>) -> anyhow::Result<String> {
+        self.chat_chat_completions(
+            "Grok",
+            &config.api_url,
+            Some(config.api_key.as_str()),
+            &config.model,
+            config.max_tokens,
+            config.temperature,
+            config.system_prompt.as_deref(),
+            messages,
+        )
+        .await
+    }
+
+    async fn chat_openai(
+        &self,
+        config: &OpenAiLlmConfig,
+        messages: Vec<ChatMessage>,
+    ) -> anyhow::Result<String> {
+        let api_key = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+
+        if api_key.is_none() {
+            anyhow::bail!(
+                "OpenAI API key is not configured. Set OPENAI_LLM_API_KEY (or OPENAI_API_KEY / STT_API_KEY / TTS_API_KEY)."
+            );
         }
 
+        self.chat_chat_completions(
+            "OpenAI",
+            &config.api_url,
+            api_key,
+            &config.model,
+            config.max_tokens,
+            config.temperature,
+            config.system_prompt.as_deref(),
+            messages,
+        )
+        .await
+    }
+
+    async fn chat_chat_completions(
+        &self,
+        provider_name: &str,
+        api_url: &str,
+        api_key: Option<&str>,
+        model: &str,
+        max_tokens: u32,
+        temperature: f32,
+        system_prompt: Option<&str>,
+        messages: Vec<ChatMessage>,
+    ) -> anyhow::Result<String> {
+        info!("Sending chat request to {} API: {}", provider_name, api_url);
+        info!("Model: {}, Incoming messages: {}", model, messages.len());
+
+        let api_key = api_key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{provider_name} API key is not configured"))?;
+
         let mut payload_messages = Vec::new();
-        if let Some(prompt) = self
-            .config
-            .system_prompt
-            .as_ref()
-            .map(|p| p.trim())
+        if let Some(prompt) = system_prompt
+            .map(str::trim)
             .filter(|p| !p.is_empty())
         {
             info!("Applying system prompt");
@@ -83,47 +160,43 @@ impl LlmService {
         }
 
         for m in messages.into_iter() {
-            // Безопасная обрезка для UTF-8 (не по байтам, а по символам)
             let preview: String = m.content.chars().take(50).collect();
-            info!(
-                "Message: role={}, content={}...",
-                m.role,
-                preview
-            );
+            info!("Message: role={}, content={}...", m.role, preview);
             payload_messages.push(Message {
                 role: m.role,
                 content: m.content,
             });
         }
 
-        let request = GrokRequest {
-            model: self.config.model.clone(),
+        let request = ChatCompletionsRequest {
+            model: model.to_string(),
             messages: payload_messages,
-            max_tokens: self.config.max_tokens,
-            temperature: self.config.temperature,
+            max_tokens,
+            temperature,
             stream: false,
         };
 
-        let url = format!("{}/chat/completions", self.config.api_url);
+        let base = api_url.trim_end_matches('/');
+        let url = format!("{}/chat/completions", base);
         info!("POST {}", url);
 
         let response = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await
-            .context("Failed to send request to Grok API")?;
+            .with_context(|| format!("Failed to send request to {provider_name}"))?;
 
         let status = response.status();
-        info!("Grok API response status: {}", status);
+        info!("{} API response status: {}", provider_name, status);
 
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            error!("Grok API error: {} - {}", status, error_text);
-            anyhow::bail!("Grok API error: {} - {}", status, error_text);
+            error!("{} API error: {} - {}", provider_name, status, error_text);
+            anyhow::bail!("{} API error: {} - {}", provider_name, status, error_text);
         }
 
         let is_stream = response
@@ -134,24 +207,28 @@ impl LlmService {
             .unwrap_or(false);
 
         if is_stream {
-            info!("Processing Grok streaming response");
+            info!("Processing {} streaming response", provider_name);
             return Self::read_streaming_response(response).await;
         }
 
-        let grok_response: GrokResponse = response
+        let resp: ChatCompletionsResponse = response
             .json()
             .await
-            .context("Failed to parse Grok API response")?;
+            .with_context(|| format!("Failed to parse {provider_name} API response"))?;
 
-        info!("Grok API response: {} choices", grok_response.choices.len());
+        info!(
+            "{} API response: {} choices (id={:?})",
+            provider_name,
+            resp.choices.len(),
+            resp.id
+        );
 
-        let content = grok_response
+        let content = resp
             .choices
             .first()
             .map(|c| c.message.content.clone())
             .unwrap_or_default();
 
-        // Безопасная обрезка для UTF-8 (не по байтам, а по символам)
         let preview: String = content.chars().take(100).collect();
         info!("Extracted content: '{}'", preview);
 
@@ -277,6 +354,25 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+enum LlmProvider {
+    Grok(GrokConfig),
+    OpenAi(OpenAiLlmConfig),
+}
+
+impl LlmProvider {
+    fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let provider = config.llm_provider.trim().to_lowercase();
+        match provider.as_str() {
+            "grok" | "xai" => Ok(Self::Grok(config.grok.clone())),
+            "openai" => Ok(Self::OpenAi(config.openai_llm.clone())),
+            other => anyhow::bail!(
+                "Unsupported LLM provider: {other}. Use LLM_PROVIDER=grok or LLM_PROVIDER=openai."
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ChatMessage, LlmService};
@@ -322,7 +418,7 @@ mod tests {
 
         // Создаем сервис с клиентом, который будет использовать мок-сервер
         let client = reqwest::Client::new();
-        let service = LlmService::new_with_client(&config, client);
+        let service = LlmService::new_grok_with_client(&config, client);
 
         // Выполняем запрос
         let messages = vec![ChatMessage {
@@ -356,7 +452,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let service = LlmService::new_with_client(&config, client);
+        let service = LlmService::new_grok_with_client(&config, client);
 
         let messages = vec![
             ChatMessage {
@@ -397,7 +493,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let service = LlmService::new_with_client(&config, client);
+        let service = LlmService::new_grok_with_client(&config, client);
 
         let messages = vec![ChatMessage {
             role: "user".to_string(),
@@ -428,7 +524,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let service = LlmService::new_with_client(&config, client);
+        let service = LlmService::new_grok_with_client(&config, client);
 
         let messages = vec![ChatMessage {
             role: "user".to_string(),
@@ -451,9 +547,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_json(serde_json::json!({
-                "model": "grok-beta",
+                "model": "grok-4",
                 "max_tokens": 2048,
                 "temperature": 0.7,
+                "stream": false,
                 "messages": [{
                     "role": "user",
                     "content": "Test message"
@@ -471,7 +568,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let service = LlmService::new_with_client(&config, client);
+        let service = LlmService::new_grok_with_client(&config, client);
 
         let messages = vec![ChatMessage {
             role: "user".to_string(),
