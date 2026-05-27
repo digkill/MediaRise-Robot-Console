@@ -11,7 +11,7 @@ use axum::{
     extract::ws::WebSocketUpgrade,  // Для обновления HTTP соединения до WebSocket
     http::HeaderMap,
     response::Response,              // Тип для HTTP ответов
-    routing::{get, post},            // Функции для создания маршрутов (GET, POST)
+    routing::{any, get, post},       // Функции для создания маршрутов
     Router,                          // Роутер - объект, который направляет запросы к нужным обработчикам
 };
 // Импортируем middleware (промежуточное ПО) для HTTP
@@ -132,10 +132,16 @@ fn create_router(config: Config, services: Services, storage: Storage) -> Router
         // ============================================
         // Health check endpoint - проверка работоспособности
         // ============================================
-        // GET /health - простой endpoint для проверки, что сервер работает
-        // Обычно используется мониторингом и балансировщиками нагрузки
-        // || async { "OK" } - это замыкание (анонимная функция), которое возвращает "OK"
         .route("/health", get(|| async { "OK" }))
+
+        // ============================================
+        // OpenAI proxy - прозрачный прокси к OpenAI API
+        // ============================================
+        // ANY /proxy/openai/*path → пробрасывает запрос к openai_llm.api_url/{path}
+        // Подставляет Bearer-ключ из конфига, поддерживает SSE-стриминг.
+        // Пример настройки в Laravel .env:
+        //   OPENAI_API_URL=http://<host>:8080/proxy/openai
+        .route("/proxy/openai/*path", any(handlers::openai_proxy::proxy))
         
         // ============================================
         // Middleware (промежуточное ПО)
