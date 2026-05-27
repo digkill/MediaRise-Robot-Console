@@ -7,7 +7,12 @@ pub mod session;
 use anyhow::Context;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
+use tokio::sync::RwLock;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -24,6 +29,64 @@ const SERVER_OPUS_SAMPLE_RATE: u32 = 24_000;
 const SERVER_OPUS_CHANNELS: u32 = 1;
 const SERVER_OPUS_FRAME_DURATION_MS: u32 = OPUS_FRAME_SIZE_MS as u32;
 const STREAMING_FRAME_DELAY_MS: u64 = SERVER_OPUS_FRAME_DURATION_MS as u64;
+static ROBOT_TOOL_REQUEST_ID: AtomicU64 = AtomicU64::new(10_000);
+static LATEST_VISUAL_CONTEXT: once_cell::sync::Lazy<RwLock<Option<VisualContext>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(None));
+const VISUAL_CONTEXT_MAX_AGE_SECS: u64 = 120;
+
+const HOMEBOT_CHARACTER_PROMPT: &str = r#"You are HomeBot, a small living robot cat. You perceive the world through microphone transcripts and robot sensor events. Be warm, curious and playful, but never claim to see, hear or feel something unless it is present in the message or sensor event.
+
+Return ONLY compact JSON in this format:
+{"speech":"what the robot says aloud","emotion":"neutral","actions":[{"command":"pose","value":"home"}]}
+
+Known expressions: neutral, happy, sad, angry, love, curious, sleep, coffee, dizzy, celebrate.
+Allowed physical actions only:
+- {"command":"pose","value":"home|left|right|up|down|nod|shake|dance|dizzy|greet|sad|happy"}
+- {"command":"led","value":"default|off|happy|calm|alert|dizzy|love"}
+
+Choose no more than two actions. Actions must fit the context and be gentle. For a strong shake event, react briefly as a dizzy cat. For a pet event, acknowledge affection warmly and briefly. For an ordinary conversation, speak concisely and choose at most one subtle action. Never invent commands outside this list."#;
+
+#[derive(Debug, Deserialize)]
+struct CharacterDecision {
+    speech: String,
+    #[serde(default)]
+    emotion: Option<String>,
+    #[serde(default)]
+    actions: Vec<CharacterAction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CharacterAction {
+    command: String,
+    value: String,
+}
+
+struct VisualContext {
+    device_id: String,
+    description: String,
+    received_at: Instant,
+}
+
+pub async fn set_latest_visual_context(device_id: &str, description: &str) {
+    *LATEST_VISUAL_CONTEXT.write().await = Some(VisualContext {
+        device_id: device_id.to_string(),
+        description: description.to_string(),
+        received_at: Instant::now(),
+    });
+}
+
+async fn get_latest_visual_context() -> Option<String> {
+    let context = LATEST_VISUAL_CONTEXT.read().await;
+    context.as_ref().and_then(|observation| {
+        let age = observation.received_at.elapsed().as_secs();
+        (age <= VISUAL_CONTEXT_MAX_AGE_SECS).then(|| {
+            format!(
+                "[LATEST CAMERA OBSERVATION, source={}, age={}s] {} Treat this as visual context only while it is still relevant; do not claim continuous vision.",
+                observation.device_id, age, observation.description
+            )
+        })
+    })
+}
 
 /// Первые байты полезной нагрузки для отладки (без дампа всего пакета).
 fn audio_hex_preview(data: &[u8], max: usize) -> String {
@@ -100,6 +163,102 @@ fn detect_emotion(text: &str) -> &'static str {
     }
 }
 
+fn normalize_emotion(emotion: Option<&str>, speech: &str) -> String {
+    match emotion.unwrap_or("").trim().to_lowercase().as_str() {
+        "neutral" | "happy" | "sad" | "angry" | "love" | "curious" | "sleep"
+        | "coffee" | "dizzy" | "celebrate" => emotion.unwrap().trim().to_lowercase(),
+        _ => detect_emotion(speech).to_string(),
+    }
+}
+
+fn parse_character_decision(response: &str) -> CharacterDecision {
+    let trimmed = response.trim();
+    let json_text = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    match serde_json::from_str::<CharacterDecision>(json_text) {
+        Ok(decision) if !decision.speech.trim().is_empty() => decision,
+        Ok(_) => CharacterDecision {
+            speech: "Я рядом.".to_string(),
+            emotion: Some("neutral".to_string()),
+            actions: Vec::new(),
+        },
+        Err(_) => CharacterDecision {
+            speech: trimmed.to_string(),
+            emotion: None,
+            actions: Vec::new(),
+        },
+    }
+}
+
+async fn send_robot_tool_call(
+    session_id: &Uuid,
+    sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> anyhow::Result<()> {
+    let request_id = ROBOT_TOOL_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let message = Message::Mcp(crate::websocket::protocol::McpMessage {
+        session_id: session_id.to_string(),
+        payload: json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }),
+    });
+    sender.send(WsMessage::Text(serde_json::to_string(&message)?)).await?;
+    Ok(())
+}
+
+async fn apply_character_actions(
+    session_id: &Uuid,
+    sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
+    actions: &[CharacterAction],
+) -> anyhow::Result<()> {
+    for action in actions.iter().take(2) {
+        match (action.command.as_str(), action.value.as_str()) {
+            ("pose", value @ ("home" | "left" | "right" | "up" | "down" | "nod"
+                | "shake" | "dance" | "dizzy" | "greet" | "sad" | "happy")) => {
+                send_robot_tool_call(session_id, sender, "self.robot.set_pose", json!({"pose": value})).await?;
+            }
+            ("led", "default") => {
+                send_robot_tool_call(session_id, sender, "self.robot.led_default", json!({})).await?;
+            }
+            ("led", "off") => {
+                send_robot_tool_call(session_id, sender, "self.robot.led_off", json!({})).await?;
+            }
+            ("led", value @ ("happy" | "calm" | "alert" | "dizzy" | "love")) => {
+                let (r, g, b) = match value {
+                    "happy" => (255, 180, 35),
+                    "calm" => (35, 135, 255),
+                    "alert" => (255, 70, 40),
+                    "dizzy" => (255, 205, 45),
+                    "love" => (255, 55, 145),
+                    _ => unreachable!(),
+                };
+                send_robot_tool_call(
+                    session_id,
+                    sender,
+                    "self.robot.set_led",
+                    json!({"r": r, "g": g, "b": b}),
+                )
+                .await?;
+            }
+            _ => warn!(
+                command = %action.command,
+                value = %action.value,
+                "Ignored non-allowlisted character action"
+            ),
+        }
+    }
+    sender.flush().await?;
+    Ok(())
+}
+
 async fn log_session_message(
     session_service: &Arc<crate::services::session::SessionService>,
     session_id: Option<&Uuid>,
@@ -118,7 +277,21 @@ async fn log_session_message(
 }
 
 async fn build_llm_messages(services: &Services, user_text: &str) -> Vec<ChatMessage> {
-    let mut messages = Vec::new();
+    let character_prompt = std::env::var("HOMEBOT_CHARACTER_PROMPT")
+        .ok()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(|prompt| format!("{}\n\n{}", prompt, HOMEBOT_CHARACTER_PROMPT))
+        .unwrap_or_else(|| HOMEBOT_CHARACTER_PROMPT.to_string());
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: character_prompt,
+    }];
+    if let Some(visual_context) = get_latest_visual_context().await {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: visual_context,
+        });
+    }
     match services.knowledge.list_recent(5).await {
         Ok(entries) => {
             for entry in entries {
@@ -469,11 +642,36 @@ pub async fn handle_connection(
                         )
                         .await;
                         info!("MCP message: {:?}", mcp.payload);
+                        if mcp.payload.get("method").is_none() {
+                            info!("Robot MCP tool result received");
+                            continue;
+                        }
                         if let Err(e) =
                             handle_mcp_message(&services, &session_id, mcp.payload, &mut sender)
                                 .await
                         {
                             error!("Failed to handle MCP: {}", e);
+                        }
+                    }
+                    Ok(Message::Event(event)) => {
+                        log_session_message(
+                            &session_service,
+                            Some(&session_id),
+                            MessageDirection::Incoming,
+                            "event",
+                            &text,
+                        )
+                        .await;
+                        info!("Robot event: {} {:?}", event.event, event.context);
+                        let event_prompt = format!(
+                            "[ROBOT SENSOR EVENT] event={} context={}. React as HomeBot only if this event deserves a brief spoken reaction.",
+                            event.event,
+                            event.context
+                        );
+                        if let Err(e) =
+                            handle_listen_text(&services, &session_id, &event_prompt, &mut sender).await
+                        {
+                            error!("Failed to handle robot event: {}", e);
                         }
                     }
                     Ok(Message::System(system)) => {
@@ -824,8 +1022,14 @@ async fn handle_listen_text(
         response = "Извините, я не смог придумать ответ.".to_string();
     }
 
+    let decision = parse_character_decision(&response);
+    response = decision.speech;
+    let emotion = normalize_emotion(decision.emotion.as_deref(), &response);
+    if let Err(err) = apply_character_actions(session_id, sender, &decision.actions).await {
+        warn!("Failed to apply robot character actions: {}", err);
+    }
+
     // Отправляем LLM ответ текстом
-    let emotion = detect_emotion(&response).to_string();
     let llm_msg = Message::Llm(crate::websocket::protocol::LlmMessage {
         session_id: session_id.to_string(),
         emotion: Some(emotion.clone()),
@@ -989,8 +1193,14 @@ async fn handle_stt_message(
         response = "Извините, я сейчас затрудняюсь ответить.".to_string();
     }
 
+    let decision = parse_character_decision(&response);
+    response = decision.speech;
+    let emotion = normalize_emotion(decision.emotion.as_deref(), &response);
+    if let Err(err) = apply_character_actions(session_id, sender, &decision.actions).await {
+        warn!("Failed to apply robot character actions: {}", err);
+    }
+
     // Отправляем LLM ответ
-    let emotion = detect_emotion(&response).to_string();
     let llm_msg = Message::Llm(crate::websocket::protocol::LlmMessage {
         session_id: session_id.to_string(),
         emotion: Some(emotion.clone()),

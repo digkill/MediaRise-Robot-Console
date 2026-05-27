@@ -118,6 +118,8 @@ fn create_router(config: Config, services: Services, storage: Storage) -> Router
         // ============================================
         // POST /upload/screenshot - загрузить скриншот с устройства
         .route("/upload/screenshot", post(handlers::upload::screenshot))
+        // POST /api/robot/vision/frame - JPEG-наблюдение с XIAO-камеры
+        .route("/api/robot/vision/frame", post(handlers::vision::frame))
         
         // ============================================
         // WebSocket endpoint - для голосового взаимодействия

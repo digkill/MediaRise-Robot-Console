@@ -3,3 +3,4 @@
 pub mod assets;
 pub mod ota;
 pub mod upload;
+pub mod vision;

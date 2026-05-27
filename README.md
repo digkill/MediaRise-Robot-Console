@@ -113,6 +113,8 @@ GROK_API_KEY=your_grok_api_key
 GROK_API_URL=https://api.x.ai/v1
 GROK_MODEL=grok-4
 GROK_SYSTEM_PROMPT=You are Grok, a highly intelligent, helpful AI assistant.
+# Optional personality override for the living robot cat:
+# HOMEBOT_CHARACTER_PROMPT=You are HomeBot, a curious little robot cat. Speak briefly and warmly.
 
 # OpenAI LLM (если LLM_PROVIDER=openai)
 # OPENAI_LLM_API_KEY=your_key
@@ -178,6 +180,23 @@ cargo run --release
 ### WebSocket
 
 - `ws://localhost:8080/ws` - WebSocket endpoint для устройств
+
+### Living HomeBot Character
+
+The WebSocket voice path now gives HomeBot a robot-cat persona and accepts
+structured physical events from the device, for example a strong shake. The
+LLM answers with spoken text, an expression, and up to two allowlisted actions.
+Only known head poses and LED presets are forwarded to the robot through MCP.
+
+Set `HOMEBOT_CHARACTER_PROMPT` in `.env` to customize the cat's character.
+The server always appends the action safety contract and JSON response format.
+
+The XIAO camera can submit JPEG snapshots to `POST /api/robot/vision/frame`.
+The backend uses a vision-capable configured LLM model to create a short factual
+observation and injects observations newer than two minutes into subsequent
+voice or app dialogue responses.
+Set `HOMEBOT_VISION_MODEL` when image analysis should use a different
+vision-capable model than normal dialogue.
 
 ## Протоколы
 

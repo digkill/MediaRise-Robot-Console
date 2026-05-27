@@ -17,6 +17,8 @@ pub enum Message {
     Llm(LlmMessage),
     #[serde(rename = "mcp")]
     Mcp(McpMessage),
+    #[serde(rename = "event")]
+    Event(EventMessage),
     #[serde(rename = "system")]
     System(SystemMessage),
     #[serde(rename = "abort")]
@@ -82,6 +84,14 @@ pub struct LlmMessage {
 pub struct McpMessage {
     pub session_id: String,
     pub payload: serde_json::Value, // JSON-RPC 2.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMessage {
+    pub session_id: String,
+    pub event: String,
+    #[serde(default)]
+    pub context: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

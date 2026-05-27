@@ -1,6 +1,7 @@
 //! LLM сервис (Grok или OpenAI)
 
 use anyhow::Context;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -95,6 +96,95 @@ impl LlmService {
             LlmProvider::Grok(cfg) => self.chat_grok(cfg, messages).await,
             LlmProvider::OpenAi(cfg) => self.chat_openai(cfg, messages).await,
         }
+    }
+
+    pub async fn describe_robot_view(&self, jpeg: &[u8]) -> anyhow::Result<String> {
+        match &self.provider {
+            LlmProvider::Grok(cfg) => {
+                let model = std::env::var("HOMEBOT_VISION_MODEL")
+                    .ok()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| cfg.model.clone());
+                self.describe_image_chat_completions(
+                    "Grok",
+                    &cfg.api_url,
+                    Some(cfg.api_key.as_str()),
+                    &model,
+                    jpeg,
+                )
+                .await
+            }
+            LlmProvider::OpenAi(cfg) => {
+                let model = std::env::var("HOMEBOT_VISION_MODEL")
+                    .ok()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| cfg.model.clone());
+                self.describe_image_chat_completions(
+                    "OpenAI",
+                    &cfg.api_url,
+                    cfg.api_key.as_deref(),
+                    &model,
+                    jpeg,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn describe_image_chat_completions(
+        &self,
+        provider_name: &str,
+        api_url: &str,
+        api_key: Option<&str>,
+        model: &str,
+        jpeg: &[u8],
+    ) -> anyhow::Result<String> {
+        let api_key = api_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{provider_name} API key is not configured"))?;
+        let image_url = format!("data:image/jpeg;base64,{}", BASE64.encode(jpeg));
+        let request = serde_json::json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You analyze the robot cat camera. Describe only clearly visible facts in one short Russian sentence. Mention people, pets, notable objects or possible hazards. Do not guess identity or emotions."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Что сейчас видно перед роботом?"},
+                        {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}}
+                    ]
+                }
+            ],
+            "max_tokens": 120,
+            "temperature": 0.1,
+            "stream": false
+        });
+        let url = format!("{}/chat/completions", api_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .with_context(|| format!("Failed to send vision request to {provider_name}"))?;
+        let status = response.status();
+        let body = response.text().await.context("Failed to read vision response")?;
+        if !status.is_success() {
+            anyhow::bail!("{provider_name} vision API error: {} - {}", status, body);
+        }
+        let json: Value = serde_json::from_str(&body).context("Failed to parse vision response")?;
+        json.pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("{provider_name} vision response contained no text"))
     }
 
     async fn chat_grok(&self, config: &GrokConfig, messages: Vec<ChatMessage>) -> anyhow::Result<String> {
