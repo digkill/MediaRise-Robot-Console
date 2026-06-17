@@ -378,20 +378,29 @@ pub async fn handle_connection(
 
                         session_id = Some(sid);
 
-                        if let Err(err) =
-                            session_service.persist_session(&sid, &resolved_device_id).await
+                        // DB ops have a 2-second timeout so a slow/blocked database never
+                        // delays the hello response (device times out in 10s).
+                        match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            session_service.persist_session(&sid, &resolved_device_id),
+                        )
+                        .await
                         {
-                            warn!("Failed to persist session {}: {}", sid, err);
+                            Err(_) => warn!("persist_session timed out (DB may be blocked)"),
+                            Ok(Err(e)) => warn!("Failed to persist session {}: {}", sid, e),
+                            Ok(Ok(())) => {}
                         }
 
-                        log_session_message(
+                        let log_fut = log_session_message(
                             &session_service,
                             Some(&sid),
                             MessageDirection::Incoming,
                             "hello",
                             &text,
-                        )
-                        .await;
+                        );
+                        if tokio::time::timeout(Duration::from_secs(2), log_fut).await.is_err() {
+                            warn!("log_session_message (hello incoming) timed out");
+                        }
 
                         // Создаем аудио процессор
                         let mut params = crate::websocket::audio::AudioProcessingParams::default();
@@ -432,14 +441,16 @@ pub async fn handle_connection(
                             error!("Failed to send hello response: {}", e);
                             break;
                         } else {
-                            log_session_message(
+                            let log_out = log_session_message(
                                 &session_service,
                                 Some(&sid),
                                 MessageDirection::Outgoing,
                                 "hello",
                                 &response_json,
-                            )
-                            .await;
+                            );
+                            if tokio::time::timeout(Duration::from_secs(2), log_out).await.is_err() {
+                                warn!("log_session_message (hello outgoing) timed out");
+                            }
                         }
 
                         info!("Session created: {}", sid);
@@ -535,6 +546,38 @@ pub async fn handle_connection(
                                 }
                             } else {
                                 warn!("Listen message without text");
+                            }
+                        } else if listen.state == "stop" {
+                            // Device finished speaking — flush any remaining audio buffer to STT
+                            info!("Listen stop: flushing audio buffer to STT");
+                            let session = SESSION_MANAGER.get_session(&session_id).await;
+                            let sample_rate = session
+                                .map(|s| s.audio_params.sample_rate)
+                                .unwrap_or(24000);
+                            if let Some(samples) = SESSION_MANAGER
+                                .take_audio_samples_force(&session_id, true)
+                                .await
+                            {
+                                let secs = samples.len() as f32 / sample_rate.max(1) as f32;
+                                info!(
+                                    session_id = %session_id,
+                                    samples = samples.len(),
+                                    duration_sec = secs,
+                                    "STT: flushing on listen/stop"
+                                );
+                                if let Err(e) = handle_audio_data(
+                                    &services,
+                                    &session_id,
+                                    &samples,
+                                    sample_rate,
+                                    &mut sender,
+                                )
+                                .await
+                                {
+                                    error!("handle_audio_data on stop failed: {:#}", e);
+                                }
+                            } else {
+                                info!("listen/stop: audio buffer empty, nothing to flush");
                             }
                         }
                     }
