@@ -29,15 +29,37 @@ const SERVER_OPUS_SAMPLE_RATE: u32 = 24_000;
 const SERVER_OPUS_CHANNELS: u32 = 1;
 const SERVER_OPUS_FRAME_DURATION_MS: u32 = OPUS_FRAME_SIZE_MS as u32;
 const STREAMING_FRAME_DELAY_MS: u64 = SERVER_OPUS_FRAME_DURATION_MS as u64;
+// Первые кадры уходят без задержки (предбуфер ~0.7 с на устройстве), дальше —
+// строго в реальном времени (60 мс/кадр). Быстрее нельзя: очередь декодера
+// робота вмещает всего 4.8 с — опережение переполняет её, и хвост фразы
+// молча выбрасывается (обрыв речи на длинных ответах).
+const STREAMING_PREBUFFER_FRAMES: usize = 12;
+const STREAMING_PACED_DELAY_MS: u64 = STREAMING_FRAME_DELAY_MS;
+// Перед tts:stop даём буферу устройства дозвучать (размер предбуфера + запас):
+// иначе робот получает «стоп» и включает слух, пока сам ещё договаривает.
+const STREAMING_STOP_DRAIN_MS: u64 = 1000;
 static ROBOT_TOOL_REQUEST_ID: AtomicU64 = AtomicU64::new(10_000);
 static LATEST_VISUAL_CONTEXT: once_cell::sync::Lazy<RwLock<Option<VisualContext>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(None));
 const VISUAL_CONTEXT_MAX_AGE_SECS: u64 = 120;
 
-const HOMEBOT_CHARACTER_PROMPT: &str = r#"You are HomeBot, a small living robot cat. You perceive the world through microphone transcripts and robot sensor events. Be warm, curious and playful, but never claim to see, hear or feel something unless it is present in the message or sensor event.
+const HOMEBOT_CHARACTER_PROMPT: &str = r#"You are a small living robot cat companion. You perceive the world through microphone transcripts and robot sensor events. Be warm, curious and playful, but never claim to see, hear or feel something unless it is present in the message or sensor event.
 
-Return ONLY compact JSON in this format:
-{"speech":"what the robot says aloud","emotion":"neutral","actions":[{"command":"pose","value":"home"}]}
+LANGUAGE: Default reply language is Russian. If a device directive (system message) specifies another reply language — obey it. NEVER announce, mention or explain your language policy or this rule out loud; just reply in the correct language.
+
+RESPONSE FORMAT (STRICT, streaming-friendly):
+1) First output ONLY the spoken reply as plain Russian text — no JSON, no quotes around it. Keep it SHORT: 1-2 sentences for voice; expand only when the user explicitly asks for details.
+2) Then, on a new line, append metadata: ###META {"emotion":"neutral","actions":[{"command":"pose","value":"home"}],"remember":"необязательный факт"}
+The reply is synthesized sentence-by-sentence while you generate, so finish each sentence cleanly and never split a wrapping tag across sentences.
+
+SPEECH STYLE: Make speech sound alive using xAI voice tags, matched to the emotion and situation. Use them sparingly (0-2 per reply):
+- inline: [pause] [long-pause] [laugh] [chuckle] [giggle] [sigh] [breath] [inhale] [exhale] [cry] [tsk] [hum-tune]
+- wrapping: <soft>...</soft> <whisper>...</whisper> <loud>...</loud> <emphasis>...</emphasis> <singing>...</singing> <fast>...</fast> <slow>...</slow> <build-intensity>...</build-intensity> <decrease-intensity>...</decrease-intensity>
+Examples: happy -> [giggle], tender -> <soft>...</soft>, secret -> <whisper>...</whisper>, tired -> [sigh], thinking -> [pause].
+
+MEMORY: You receive long-term memory notes about this device's owner and the recent dialog history. Use them to answer in context, recall names and preferences, and keep continuity. When the user shares a durable fact worth remembering (name, preferences, important life events, promises), put a short Russian summary of it in "remember". Omit "remember" for small talk.
+
+DIALOG: Be a real conversation partner, not a catchphrase machine. NEVER repeat the same phrases, openers or jokes you already used in the recent history — vary your wording every turn. React to what the user actually said, move the topic forward, and when natural ask a short follow-up question. If the user is annoyed, change your approach instead of repeating yourself.
 
 Known expressions: neutral, happy, sad, angry, love, curious, sleep, coffee, dizzy, celebrate.
 Allowed physical actions only:
@@ -53,6 +75,9 @@ struct CharacterDecision {
     emotion: Option<String>,
     #[serde(default)]
     actions: Vec<CharacterAction>,
+    /// Короткий факт, который LLM решил сохранить в долговременную память устройства
+    #[serde(default)]
+    remember: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,11 +210,13 @@ fn parse_character_decision(response: &str) -> CharacterDecision {
             speech: "Я рядом.".to_string(),
             emotion: Some("neutral".to_string()),
             actions: Vec::new(),
+            remember: None,
         },
         Err(_) => CharacterDecision {
             speech: trimmed.to_string(),
             emotion: None,
             actions: Vec::new(),
+            remember: None,
         },
     }
 }
@@ -276,7 +303,61 @@ async fn log_session_message(
     }
 }
 
-async fn build_llm_messages(services: &Services, user_text: &str) -> Vec<ChatMessage> {
+/// Мусорный транскрипт: пусто, меньше двух букв/цифр, либо известная
+/// галлюцинация Whisper на тишине/шуме («Редактор субтитров…», «Субтитры
+/// сделал…» и т.п. — модель обучалась на видео с титрами и на тихом аудио
+/// выдаёт их). Такое не отправляем в LLM: ответы «невпопад» и ложные факты
+/// в памяти растут отсюда.
+fn is_junk_transcript(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+        return true;
+    }
+    const HALLUCINATION_MARKERS: &[&str] = &[
+        "субтитр",
+        "редактор",
+        "корректор",
+        "продолжение следует",
+        "спасибо за просмотр",
+        "подписывайтесь",
+        "dimatorzok",
+        "amara.org",
+        "www.",
+    ];
+    let lower = trimmed.to_lowercase();
+    HALLUCINATION_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Достаёт человекочитаемый текст из логов сессий: там хранится протокольный
+/// JSON вида {"type":"llm","text":"...", ...} либо сырой текст.
+fn extract_dialog_text(payload: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => value
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        Err(_) => {
+            let trimmed = payload.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+    }
+}
+
+/// device_id активной сессии — ключ памяти робота.
+async fn session_device_id(session_id: &Uuid) -> Option<String> {
+    SESSION_MANAGER
+        .get_session(session_id)
+        .await
+        .map(|session| session.device_id)
+}
+
+async fn build_llm_messages(
+    services: &Services,
+    user_text: &str,
+    device_id: Option<&str>,
+    reply_directive: Option<&str>,
+) -> Vec<ChatMessage> {
     let character_prompt = std::env::var("HOMEBOT_CHARACTER_PROMPT")
         .ok()
         .filter(|prompt| !prompt.trim().is_empty())
@@ -286,6 +367,12 @@ async fn build_llm_messages(services: &Services, user_text: &str) -> Vec<ChatMes
         role: "system".to_string(),
         content: character_prompt,
     }];
+    if let Some(directive) = reply_directive.map(str::trim).filter(|d| !d.is_empty()) {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!("Директива устройства (обязательна к исполнению): {}", directive),
+        });
+    }
     if let Some(visual_context) = get_latest_visual_context().await {
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -305,11 +392,103 @@ async fn build_llm_messages(services: &Services, user_text: &str) -> Vec<ChatMes
             warn!("Failed to load custom knowledge: {}", err);
         }
     }
+
+    // Память робота: долговременные факты + недавний диалог этого устройства.
+    // Факты выбираются семантически (косинусная близость эмбеддингов к текущей
+    // реплике); при недоступности эмбеддингов — просто последние записи.
+    if let Some(device_id) = device_id {
+        let memories = if services.embedding.is_enabled() {
+            match services.embedding.embed(user_text).await {
+                Ok(query_embedding) => services
+                    .memory
+                    .search_memories(device_id, &query_embedding, 8)
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!("Semantic memory search failed: {}", err);
+                        Vec::new()
+                    }),
+                Err(err) => {
+                    warn!("Query embedding failed, falling back to recent: {}", err);
+                    services
+                        .memory
+                        .list_memories(device_id, 15)
+                        .await
+                        .unwrap_or_default()
+                }
+            }
+        } else {
+            services
+                .memory
+                .list_memories(device_id, 15)
+                .await
+                .unwrap_or_default()
+        };
+        if !memories.is_empty() {
+            let notes = memories
+                .iter()
+                .map(|m| format!("- {}", m))
+                .collect::<Vec<_>>()
+                .join("\n");
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: format!(
+                    "Долговременная память об этом устройстве и его владельце (наиболее релевантное текущей теме):\n{}",
+                    notes
+                ),
+            });
+        }
+        match services.memory.recent_dialog(device_id, 16).await {
+            Ok(turns) => {
+                for turn in turns {
+                    if let Some(text) = extract_dialog_text(&turn.content) {
+                        messages.push(ChatMessage {
+                            role: turn.role,
+                            content: text,
+                        });
+                    }
+                }
+            }
+            Err(err) => warn!("Failed to load recent dialog: {}", err),
+        }
+    }
+
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: user_text.to_string(),
     });
     messages
+}
+
+/// Сохраняет факт из decision.remember в память устройства (если есть),
+/// вместе с эмбеддингом для семантического поиска.
+async fn store_decision_memory(
+    services: &Services,
+    device_id: Option<&str>,
+    remember: Option<&str>,
+) {
+    if let (Some(device_id), Some(fact)) = (device_id, remember) {
+        if !fact.trim().is_empty() {
+            info!(device_id, fact, "Saving long-term memory note");
+            let embedding = if services.embedding.is_enabled() {
+                match services.embedding.embed(fact).await {
+                    Ok(e) => Some(e),
+                    Err(err) => {
+                        warn!("Failed to embed memory note: {}", err);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Err(err) = services
+                .memory
+                .add_memory(device_id, fact, embedding.as_deref())
+                .await
+            {
+                warn!("Failed to save device memory: {}", err);
+            }
+        }
+    }
 }
 
 pub async fn handle_connection(
@@ -500,8 +679,28 @@ pub async fn handle_connection(
                         .await;
                         info!("Listen message: {:?}", listen);
                         if listen.state == "start" {
+                            // Директива поведения (язык ответа, переводчик) — НЕ
+                            // пользовательская реплика: сохраняем в сессию и в LLM
+                            // не отправляем. Отсутствие директивы сбрасывает её.
+                            let directive = listen.text.as_deref().and_then(|t| {
+                                let trimmed = t.trim();
+                                if let Some(stripped) = trimmed.strip_prefix("[[directive]]") {
+                                    Some(stripped.trim().to_string())
+                                } else if trimmed.starts_with("Translator mode is enabled") {
+                                    Some(trimmed.to_string()) // старые прошивки без префикса
+                                } else {
+                                    None
+                                }
+                            });
+                            let is_directive = directive.is_some();
+                            SESSION_MANAGER
+                                .set_reply_directive(&session_id, directive.clone())
+                                .await;
+                            if let Some(d) = directive {
+                                info!(directive = %d, "Session reply directive updated");
+                            }
                             // Начинаем прослушивание
-                            if let Some(text) = listen.text {
+                            if let Some(text) = listen.text.filter(|_| !is_directive) {
                                 info!("Processing listen text: '{}'", text);
                                 // Обрабатываем текст напрямую
                                 match handle_listen_text(&services, &session_id, &text, &mut sender)
@@ -576,6 +775,9 @@ pub async fn handle_connection(
                                 {
                                     error!("handle_audio_data on stop failed: {:#}", e);
                                 }
+                                // Сбрасываем натёкший за время обработки хвост,
+                                // чтобы не породить второй ответ.
+                                SESSION_MANAGER.clear_audio_buffer(&session_id).await;
                             } else {
                                 info!("listen/stop: audio buffer empty, nothing to flush");
                             }
@@ -854,6 +1056,15 @@ pub async fn handle_connection(
                                             e
                                         );
                                     }
+                                    // Пока фраза обрабатывалась (STT -> LLM -> TTS)
+                                    // и ответ проигрывался, в буфер натекли новые
+                                    // пакеты (эхо, речь во время ожидания). Сбрасываем
+                                    // их: одна фраза -> один ответ, без наложений.
+                                    SESSION_MANAGER.clear_audio_buffer(&session_id).await;
+                                    info!(
+                                        session_id = %session_id,
+                                        "audio backlog cleared after reply (no overlap)"
+                                    );
                                 }
                             } else {
                                 // Буфер еще не готов - просто накапливаем
@@ -1043,8 +1254,14 @@ async fn handle_listen_text(
 ) -> anyhow::Result<()> {
     info!("Processing listen text: '{}'", text);
 
-    // Обрабатываем текст через LLM
-    let messages = build_llm_messages(services, text).await;
+    // Обрабатываем текст через LLM (с памятью устройства)
+    let device_id = session_device_id(session_id).await;
+    let listen_directive = SESSION_MANAGER
+        .get_session(session_id)
+        .await
+        .and_then(|s| s.reply_directive);
+    let messages =
+        build_llm_messages(services, text, device_id.as_deref(), listen_directive.as_deref()).await;
 
     info!("Calling LLM service with {} messages", messages.len());
     let mut response = match services.llm.chat(messages).await {
@@ -1062,10 +1279,11 @@ async fn handle_listen_text(
 
     if response.trim().is_empty() {
         warn!("LLM returned empty response, using default fallback");
-        response = "Извините, я не смог придумать ответ.".to_string();
+        response = "Извини, я не смогла придумать ответ.".to_string();
     }
 
     let decision = parse_character_decision(&response);
+    store_decision_memory(services, device_id.as_deref(), decision.remember.as_deref()).await;
     response = decision.speech;
     let emotion = normalize_emotion(decision.emotion.as_deref(), &response);
     if let Err(err) = apply_character_actions(session_id, sender, &decision.actions).await {
@@ -1213,53 +1431,163 @@ async fn handle_stt_message(
         }
     }
 
-    // Обрабатываем транскрибированный текст через LLM
-    let messages = build_llm_messages(services, text).await;
+    // ── Стриминговый пайплайн: LLM-дельты -> предложения -> TTS по мере
+    // генерации. Первый звук уходит на устройство, пока остальной ответ ещё
+    // пишется — это главный источник «алекса-скорости».
+    let device_id = session_device_id(session_id).await;
+    let session = SESSION_MANAGER.get_session(session_id).await;
+    let reply_directive = session.as_ref().and_then(|s| s.reply_directive.clone());
+    let messages = build_llm_messages(
+        services,
+        text,
+        device_id.as_deref(),
+        reply_directive.as_deref(),
+    )
+    .await;
+    let use_bp3 = session
+        .as_ref()
+        .map(|s| s.protocol_version == 3)
+        .unwrap_or(false);
+    let audio_format: Option<String> = session.and_then(|s| s.audio_format);
 
-    info!("Calling LLM service with {} messages", messages.len());
-    let mut response = match services.llm.chat(messages).await {
-        Ok(resp) => {
-            info!("LLM response received: '{}'", resp);
-            resp
-        }
+    // tts:start уходит СРАЗУ, как только фраза принята в обработку: робот
+    // мгновенно переходит в «говорю», перестаёт слать микрофон и ждёт ответ —
+    // без этого он продолжал «слушать» всё время, пока сервер думал.
+    send_tts_start(sender, session_id).await;
+    let tts_started = true;
+
+    info!("Calling LLM service (stream) with {} messages", messages.len());
+    let mut delta_rx = match services.llm.chat_stream(messages).await {
+        Ok(rx) => Some(rx),
         Err(e) => {
-            // Важно: даже если LLM упал/нет ключа/лимит — всё равно отвечаем голосом,
-            // иначе на устройстве будет только ">> ..." и "нет звука".
-            error!("LLM service error: {}", e);
-            warn!("Falling back to direct TTS response");
-            format!("Я тебя услышал: {}", text)
+            error!("LLM stream error: {}", e);
+            None
         }
     };
 
-    if response.trim().is_empty() {
-        warn!("LLM returned empty response, using fallback");
-        response = "Извините, я сейчас затрудняюсь ответить.".to_string();
+    let mut speech_full = String::new(); // вся озвученная речь
+    let mut sentence_buf = String::new(); // недоговорённый хвост
+    let mut meta_tail = String::new(); // всё после ###
+    let mut in_meta = false;
+    let mut first_segment = true;
+    let mut synth_queue: std::collections::VecDeque<
+        tokio::task::JoinHandle<anyhow::Result<SynthesizedAudio>>,
+    > = std::collections::VecDeque::new();
+
+    // Локальный помощник: ставим предложение в синтез (с lookahead 1) и
+    // отправляем готовые сегменты по мере их завершения.
+    macro_rules! enqueue_sentence {
+        ($sentence:expr) => {{
+            let sentence: String = $sentence;
+            info!(sentence = %sentence, "TTS segment queued");
+            speech_full.push_str(&sentence);
+            speech_full.push(' ');
+            let tts = services.tts.clone();
+            let format = audio_format.clone();
+            synth_queue.push_back(tokio::spawn(async move {
+                tts.synthesize_with_format(&sentence, format.as_deref()).await
+            }));
+            // Держим не больше одного «запасного» синтеза: остальное отправляем.
+            while synth_queue.len() > 1 {
+                let handle = synth_queue.pop_front().unwrap();
+                match handle.await {
+                    Ok(Ok(audio)) => {
+                        if let Err(e) =
+                            send_synthesized_segment(sender, audio, use_bp3, first_segment).await
+                        {
+                            warn!("TTS segment send failed: {}", e);
+                        }
+                        first_segment = false;
+                    }
+                    Ok(Err(e)) => warn!("TTS segment synthesis failed: {}", e),
+                    Err(e) => warn!("TTS synth task join error: {}", e),
+                }
+            }
+        }};
     }
 
-    let decision = parse_character_decision(&response);
-    response = decision.speech;
-    let emotion = normalize_emotion(decision.emotion.as_deref(), &response);
-    if let Err(err) = apply_character_actions(session_id, sender, &decision.actions).await {
+    if let Some(rx) = delta_rx.as_mut() {
+        while let Some(delta) = rx.recv().await {
+            if in_meta {
+                meta_tail.push_str(&delta);
+                continue;
+            }
+            sentence_buf.push_str(&delta);
+            if let Some(pos) = sentence_buf.find("###") {
+                meta_tail.push_str(&sentence_buf[pos..]);
+                sentence_buf.truncate(pos);
+                in_meta = true;
+            }
+            while let Some(sentence) = take_sentence(&mut sentence_buf) {
+                enqueue_sentence!(sentence);
+            }
+        }
+    }
+
+    // Хвост без завершающей точки — тоже озвучиваем.
+    let tail = sentence_buf.trim().to_string();
+    if !tail.is_empty() {
+        enqueue_sentence!(tail);
+    }
+
+    // Модель могла проигнорировать формат и вернуть старый JSON целиком.
+    let mut legacy_meta: Option<CharacterDecision> = None;
+    if speech_full.trim().starts_with('{') {
+        let decision = parse_character_decision(speech_full.trim());
+        speech_full = decision.speech.clone();
+        if !speech_full.trim().is_empty() {
+            enqueue_sentence!(speech_full.clone());
+        }
+        legacy_meta = Some(decision);
+    }
+
+    // LLM недоступна или ответ пуст — отвечаем голосом, а не тишиной.
+    if speech_full.trim().is_empty() && synth_queue.is_empty() {
+        warn!("LLM produced no speech, using fallback phrase");
+        let fallback = "Прости, я на секунду задумалась. [pause] Повтори, пожалуйста?".to_string();
+        enqueue_sentence!(fallback);
+    }
+
+    // Дренируем оставшиеся синтезы.
+    while let Some(handle) = synth_queue.pop_front() {
+        match handle.await {
+            Ok(Ok(audio)) => {
+                if let Err(e) = send_synthesized_segment(sender, audio, use_bp3, first_segment).await
+                {
+                    warn!("TTS segment send failed: {}", e);
+                }
+                first_segment = false;
+            }
+            Ok(Err(e)) => warn!("TTS segment synthesis failed: {}", e),
+            Err(e) => warn!("TTS synth task join error: {}", e),
+        }
+    }
+
+    let speech_full = speech_full.trim().to_string();
+    info!("LLM streamed response: '{}'", speech_full);
+
+    // Метаданные: эмоция, действия, память.
+    let meta = parse_stream_meta(&meta_tail);
+    let (emotion_raw, actions, remember) = if let Some(legacy) = legacy_meta {
+        (legacy.emotion, legacy.actions, legacy.remember)
+    } else {
+        (meta.emotion, meta.actions, meta.remember)
+    };
+    let emotion = normalize_emotion(emotion_raw.as_deref(), &speech_full);
+    store_decision_memory(services, device_id.as_deref(), remember.as_deref()).await;
+    if let Err(err) = apply_character_actions(session_id, sender, &actions).await {
         warn!("Failed to apply robot character actions: {}", err);
     }
 
-    // Отправляем LLM ответ
+    // Текст ответа и эмоция — устройству (лог/экран).
     let llm_msg = Message::Llm(crate::websocket::protocol::LlmMessage {
         session_id: session_id.to_string(),
         emotion: Some(emotion.clone()),
-        text: Some(response.clone()),
+        text: Some(speech_full.clone()),
     });
-
-    let llm_json = serde_json::to_string(&llm_msg).context("Failed to serialize LLM message")?;
-
-    info!("Sending LLM message: {}", llm_json);
-    match sender.send(WsMessage::Text(llm_json.clone())).await {
-        Ok(_) => {
-            info!("LLM message sent successfully");
-            // Flush для гарантии отправки
-            if let Err(e) = sender.flush().await {
-                warn!("Failed to flush WebSocket after LLM message (connection may be closed): {}", e);
-            }
+    if let Ok(llm_json) = serde_json::to_string(&llm_msg) {
+        if sender.send(WsMessage::Text(llm_json.clone())).await.is_ok() {
+            let _ = sender.flush().await;
             log_session_message(
                 &services.session,
                 Some(session_id),
@@ -1269,85 +1597,60 @@ async fn handle_stt_message(
             )
             .await;
         }
-        Err(e) => {
-            let error_msg = format!("{}", e);
-            if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
-                warn!("Client closed connection before LLM message could be sent. Continuing with TTS anyway.");
-                // Продолжаем обработку для TTS
-            } else {
-                error!("Failed to send LLM message: {}", e);
-                return Err(anyhow::anyhow!("Failed to send LLM message: {}", e));
-            }
-        }
     }
 
-    // Отправляем TTS аудио
-    info!("Synthesizing TTS for response: '{}'", response);
-
-    // Обновляем текст на экране устройства (оно показывает его через tts:sentence_start)
-    let sentence_start = Message::Tts(crate::websocket::protocol::TtsMessage {
-        session_id: session_id.to_string(),
-        state: "sentence_start".to_string(),
-        text: Some(response.clone()),
-    });
-    if let Ok(json) = serde_json::to_string(&sentence_start) {
-        let _ = sender.send(WsMessage::Text(json)).await;
-        let _ = sender.flush().await;
-    }
-
-    // Получаем формат из сессии или используем из конфигурации
-    let session = SESSION_MANAGER.get_session(session_id).await;
-    let audio_format_option = session.and_then(|s| s.audio_format);
-    let audio_format = audio_format_option.as_deref();
-    let tts_audio = match services.tts.synthesize_with_format(&response, audio_format).await {
-        Ok(audio) => {
-            info!("TTS audio synthesized: {} bytes", audio.total_bytes());
-            audio
-        }
-        Err(e) => {
-            error!("TTS synthesis error: {}", e);
-            let mut err_text = format!("TTS error: {}", e);
-            if err_text.len() > 200 {
-                err_text.truncate(200);
-            }
-            let msg = Message::Tts(crate::websocket::protocol::TtsMessage {
-                session_id: session_id.to_string(),
-                state: "error".to_string(),
-                text: Some(err_text),
-            });
-            if let Ok(json) = serde_json::to_string(&msg) {
-                let _ = sender.send(WsMessage::Text(json)).await;
-                let _ = sender.flush().await;
-            }
-            return Ok(());
-        }
-    };
-
-    info!("Sending TTS audio: {} bytes", tts_audio.total_bytes());
-    let audio_total = tts_audio.total_bytes();
-    let send_result = send_tts_audio(sender, session_id, tts_audio).await;
-
-    if let Err(e) = send_result {
-        let error_msg = format!("{}", e);
-        if error_msg.contains("Broken pipe") || error_msg.contains("Connection closed") {
-            warn!("Client closed connection before TTS audio could be sent. This is normal if client disconnected.");
-        } else {
-            error!("Failed to send TTS audio: {}", error_msg);
-            return Err(e);
-        }
-    } else {
-        info!("TTS audio sent successfully");
+    // Завершаем воспроизведение: ждём, пока буфер устройства дозвучит,
+    // и только потом шлём stop.
+    if tts_started {
+        sleep(Duration::from_millis(STREAMING_STOP_DRAIN_MS)).await;
+        send_tts_stop(sender, session_id).await;
         log_session_message(
             &services.session,
             Some(session_id),
             MessageDirection::Outgoing,
             "tts_audio",
-            &format!("{} bytes", audio_total),
+            "streamed",
         )
         .await;
     }
 
     Ok(())
+}
+
+async fn send_tts_start(
+    sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
+    session_id: &Uuid,
+) {
+    let start = Message::Tts(crate::websocket::protocol::TtsMessage {
+        session_id: session_id.to_string(),
+        state: "start".to_string(),
+        text: None,
+    });
+    if let Ok(json) = serde_json::to_string(&start) {
+        if let Err(e) = sender.send(WsMessage::Text(json)).await {
+            warn!("Failed to send tts:start: {}", e);
+        } else {
+            let _ = sender.flush().await;
+        }
+    }
+}
+
+async fn send_tts_stop(
+    sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
+    session_id: &Uuid,
+) {
+    let stop = Message::Tts(crate::websocket::protocol::TtsMessage {
+        session_id: session_id.to_string(),
+        state: "stop".to_string(),
+        text: None,
+    });
+    if let Ok(json) = serde_json::to_string(&stop) {
+        if let Err(e) = sender.send(WsMessage::Text(json)).await {
+            warn!("Failed to send tts:stop: {}", e);
+        } else {
+            let _ = sender.flush().await;
+        }
+    }
 }
 
 #[instrument(skip_all, fields(session_id = %session_id))]
@@ -1405,26 +1708,7 @@ async fn send_tts_audio(
         }
     }
 
-    match synthesized {
-        SynthesizedAudio::OpusFrames(frames) => {
-            info!("Sending {} Opus frames (paced {}ms)", frames.len(), STREAMING_FRAME_DELAY_MS);
-            for (idx, frame) in frames.into_iter().enumerate() {
-                if frame.is_empty() {
-                    continue;
-                }
-                let payload = if use_bp3 { frame_bp3(&frame)? } else { frame };
-                if let Err(e) = sender.send(WsMessage::Binary(payload)).await {
-                    return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
-                }
-                sleep(Duration::from_millis(STREAMING_FRAME_DELAY_MS)).await;
-            }
-            let _ = sender.flush().await;
-        }
-        SynthesizedAudio::Binary(data) => {
-            sender.send(WsMessage::Binary(data)).await?;
-            let _ = sender.flush().await;
-        }
-    }
+    send_synthesized_segment(sender, synthesized, use_bp3, true).await?;
 
     let stop = Message::Tts(crate::websocket::protocol::TtsMessage {
         session_id: session_id.to_string(),
@@ -1442,6 +1726,101 @@ async fn send_tts_audio(
     Ok(())
 }
 
+/// Отправляет один синтезированный сегмент (предложение или всю реплику).
+/// Предбуфер применяется только к первому сегменту реплики — дальше буфер
+/// устройства уже наполнен и кадры идут в обычном темпе.
+async fn send_synthesized_segment(
+    sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
+    synthesized: SynthesizedAudio,
+    use_bp3: bool,
+    first_segment: bool,
+) -> anyhow::Result<()> {
+    match synthesized {
+        SynthesizedAudio::OpusFrames(frames) => {
+            let prebuffer = if first_segment { STREAMING_PREBUFFER_FRAMES } else { 2 };
+            info!(
+                "Sending {} Opus frames (prebuffer {}, paced {}ms)",
+                frames.len(), prebuffer, STREAMING_PACED_DELAY_MS
+            );
+            for (idx, frame) in frames.into_iter().enumerate() {
+                if frame.is_empty() {
+                    continue;
+                }
+                let payload = if use_bp3 { frame_bp3(&frame)? } else { frame };
+                if let Err(e) = sender.send(WsMessage::Binary(payload)).await {
+                    return Err(anyhow::anyhow!("Failed to send Opus frame {}: {}", idx, e));
+                }
+                if idx >= prebuffer {
+                    sleep(Duration::from_millis(STREAMING_PACED_DELAY_MS)).await;
+                } else if idx + 1 == prebuffer {
+                    let _ = sender.flush().await;
+                }
+            }
+            let _ = sender.flush().await;
+        }
+        SynthesizedAudio::Binary(data) => {
+            sender.send(WsMessage::Binary(data)).await?;
+            let _ = sender.flush().await;
+        }
+    }
+    Ok(())
+}
+
+/// Баланс wrapping-тегов (<soft>…</soft>): не режем предложение внутри тега.
+fn wrap_tags_balanced(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut opens = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                opens -= 1;
+            } else {
+                opens += 1;
+            }
+        }
+        i += 1;
+    }
+    opens <= 0
+}
+
+/// Вынимает из буфера первое законченное предложение (граница . ! ? …),
+/// если оно достаточно длинное и не рвёт wrapping-теги.
+fn take_sentence(buf: &mut String) -> Option<String> {
+    const MIN_SENTENCE_BYTES: usize = 40; // ~20 кириллических символов
+    let mut boundary = None;
+    for (i, c) in buf.char_indices() {
+        if matches!(c, '.' | '!' | '?' | '…') {
+            let end = i + c.len_utf8();
+            if end >= MIN_SENTENCE_BYTES && wrap_tags_balanced(&buf[..end]) {
+                boundary = Some(end);
+                break;
+            }
+        }
+    }
+    let end = boundary?;
+    let sentence = buf[..end].trim().to_string();
+    buf.replace_range(..end, "");
+    (!sentence.is_empty()).then_some(sentence)
+}
+
+/// Метаданные, которые модель добавляет в конце реплики после ###META.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StreamMeta {
+    #[serde(default)]
+    emotion: Option<String>,
+    #[serde(default)]
+    actions: Vec<CharacterAction>,
+    #[serde(default)]
+    remember: Option<String>,
+}
+
+fn parse_stream_meta(tail: &str) -> StreamMeta {
+    tail.find('{')
+        .and_then(|pos| serde_json::from_str::<StreamMeta>(tail[pos..].trim()).ok())
+        .unwrap_or_default()
+}
+
 #[instrument(skip_all, fields(session_id = %_session_id))]
 async fn handle_llm_message(
     services: &Services,
@@ -1449,7 +1828,13 @@ async fn handle_llm_message(
     text: &str,
     sender: &mut futures::stream::SplitSink<WebSocket, WsMessage>,
 ) -> anyhow::Result<()> {
-    let messages = build_llm_messages(services, text).await;
+    let device_id = session_device_id(_session_id).await;
+    let llm_directive = SESSION_MANAGER
+        .get_session(_session_id)
+        .await
+        .and_then(|s| s.reply_directive);
+    let messages =
+        build_llm_messages(services, text, device_id.as_deref(), llm_directive.as_deref()).await;
 
     let response = services.llm.chat(messages).await?;
 
@@ -1548,13 +1933,13 @@ async fn handle_audio_data(
     );
     debug!(session_id = %session_id, transcript = %text, "STT transcript text");
 
-    if !text.is_empty() {
+    if !is_junk_transcript(&text) {
         // Обрабатываем через LLM и отправляем ответы
         handle_stt_message(services, session_id, &text, sender)
             .await
             .context("Failed to process STT result")?;
     } else {
-        warn!("Empty transcription result");
+        warn!(transcript = %text, "Junk/empty transcription skipped");
     }
 
     Ok(())
@@ -1595,7 +1980,7 @@ async fn handle_raw_audio(
         }
     };
 
-    if !text.is_empty() {
+    if !is_junk_transcript(&text) {
         info!(
             session_id = %session_id,
             "LLM pipeline after STT (raw path)"

@@ -17,6 +17,9 @@ pub struct Session {
     pub protocol_version: u32,
     pub audio_params: AudioParams,
     pub audio_format: Option<String>, // "opus" или "mp3"
+    /// Директива поведения от устройства (язык ответа, режим переводчика):
+    /// приходит в listen.start c префиксом [[directive]] и попадает в контекст LLM.
+    pub reply_directive: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,30 +46,89 @@ pub struct AudioBuffer {
     sample_rate: u32,
     /// Минимальная длительность для отправки в STT (в секундах)
     min_duration_secs: f32,
+    /// Пиковая амплитуда с момента последнего take/clear — грубый признак речи
+    peak_amplitude: i16,
+    /// Сумма квадратов сэмплов — для среднего RMS буфера (адаптивный порог)
+    sum_squares: f64,
 }
 
 impl AudioBuffer {
+    /// Конец фразы = столько секунд тишины в хвосте буфера.
+    const TAIL_SILENCE_SECS: f32 = 0.6;
+    /// Нижняя граница порога тишины (int16 PCM). Фактический порог адаптивный:
+    /// max(этого, 25% среднего RMS буфера) — иначе на тихом микрофоне речь
+    /// принимается за паузу и фразы рубятся на полуторасекундные огрызки.
+    const SILENCE_RMS_FLOOR: f32 = 140.0;
+    /// Амплитуда выше этого порога — в буфере точно была речь.
+    const SPEECH_PEAK: i16 = 900;
+    /// Защита: не копим фразу дольше этого.
+    const MAX_UTTERANCE_SECS: f32 = 12.0;
+
     /// Создает новый буфер
     pub fn new(sample_rate: u32) -> Self {
         Self {
             samples: Vec::new(),
             sample_rate,
-            // Компромисс между качеством транскрипции и задержкой
-            // Whisper API требует минимум 0.1 секунды, но лучше работает с более длинными сегментами
-            // 0.5 секунды - хороший баланс для интерактивного общения
-            min_duration_secs: 0.5, // Минимум 0.5 секунды (500 мс)
+            // Минимальная длина осмысленной фразы. Раньше здесь было 0.5 с и
+            // буфер уходил в STT, как только наполнялся, — предложения резались
+            // на полусекундные огрызки. Теперь флаш происходит по КОНЦУ ФРАЗЫ
+            // (тишина в хвосте), а это лишь нижняя граница.
+            min_duration_secs: 0.8,
+            peak_amplitude: 0,
+            sum_squares: 0.0,
         }
     }
 
     /// Добавляет samples в буфер
     pub fn add_samples(&mut self, samples: &[i16]) {
+        for &s in samples {
+            let a = s.saturating_abs();
+            if a > self.peak_amplitude {
+                self.peak_amplitude = a;
+            }
+            self.sum_squares += (s as f64) * (s as f64);
+        }
         self.samples.extend_from_slice(samples);
     }
 
-    /// Проверяет, достаточно ли данных для отправки в STT
+    /// Средний RMS всего буфера
+    fn average_rms(&self) -> f32 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        ((self.sum_squares / self.samples.len() as f64).sqrt()) as f32
+    }
+
+    /// Была ли в буфере речь (а не только шум/тишина)
+    pub fn has_speech(&self) -> bool {
+        self.peak_amplitude >= Self::SPEECH_PEAK
+    }
+
+    /// RMS хвоста буфера длиной secs; MAX, если данных меньше
+    fn tail_rms(&self, secs: f32) -> f32 {
+        let n = (secs * self.sample_rate as f32) as usize;
+        if n == 0 || self.samples.len() < n {
+            return f32::MAX;
+        }
+        let tail = &self.samples[self.samples.len() - n..];
+        let sum: f64 = tail.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        ((sum / n as f64).sqrt()) as f32
+    }
+
+    /// Готов ли буфер к отправке в STT: фраза закончилась (речь была, а в
+    /// хвосте — тишина) либо достигнут максимум длительности.
     pub fn is_ready(&self) -> bool {
-        let duration_secs = self.samples.len() as f32 / self.sample_rate as f32;
-        duration_secs >= self.min_duration_secs
+        let duration_secs = self.duration_secs();
+        if duration_secs >= Self::MAX_UTTERANCE_SECS {
+            return true;
+        }
+        if duration_secs < self.min_duration_secs + Self::TAIL_SILENCE_SECS {
+            return false;
+        }
+        // Порог тишины адаптируется к фактической громкости буфера: хвост
+        // должен быть ощутимо тише средней громкости речи.
+        let threshold = Self::SILENCE_RMS_FLOOR.max(self.average_rms() * 0.25);
+        self.has_speech() && self.tail_rms(Self::TAIL_SILENCE_SECS) < threshold
     }
 
     /// Получает длительность накопленного аудио в секундах
@@ -81,11 +143,15 @@ impl AudioBuffer {
 
     /// Извлекает и очищает накопленные samples
     pub fn take_samples(&mut self) -> Vec<i16> {
+        self.peak_amplitude = 0;
+        self.sum_squares = 0.0;
         std::mem::take(&mut self.samples)
     }
 
     /// Очищает буфер
     pub fn clear(&mut self) {
+        self.peak_amplitude = 0;
+        self.sum_squares = 0.0;
         self.samples.clear();
     }
 
@@ -135,6 +201,7 @@ impl SessionManager {
             protocol_version,
             audio_params,
             audio_format,
+            reply_directive: None,
         };
 
         self.sessions.write().await.insert(session_id, session);
@@ -143,6 +210,13 @@ impl SessionManager {
 
     pub async fn get_session(&self, session_id: &SessionId) -> Option<Session> {
         self.sessions.read().await.get(session_id).cloned()
+    }
+
+    /// Обновляет поведенческую директиву сессии (язык ответа и т.п.).
+    pub async fn set_reply_directive(&self, session_id: &SessionId, directive: Option<String>) {
+        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+            session.reply_directive = directive;
+        }
     }
 
     pub async fn remove_session(&self, session_id: &SessionId) {
@@ -159,10 +233,17 @@ impl SessionManager {
         
         // Получаем или создаем буфер для этой сессии
         let buffer = buffers.entry(*session_id).or_insert_with(|| AudioBuffer::new(sample_rate));
-        
+
         // Добавляем samples
         buffer.add_samples(samples);
-        
+
+        // Затянувшаяся тишина без речи — выбрасываем, а не отправляем в STT:
+        // Whisper на тишине галлюцинирует («Редактор субтитров…» и т.п.)
+        if buffer.duration_secs() > 6.0 && !buffer.has_speech() {
+            buffer.clear();
+            return false;
+        }
+
         // Проверяем, готов ли буфер к отправке
         buffer.is_ready()
     }

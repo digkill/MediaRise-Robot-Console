@@ -74,12 +74,145 @@ impl TtsService {
 
         match self.config.provider.as_str() {
             "openai" => self.synthesize_openai_with_format(text, &audio_format).await,
+            "grok" | "xai" => self.synthesize_xai_with_format(text, &audio_format).await,
             "local" => {
                 anyhow::bail!("Local TTS not implemented yet");
             }
             _ => {
                 anyhow::bail!("Unsupported TTS provider: {}", self.config.provider);
             }
+        }
+    }
+
+    /// xAI (Grok) TTS: POST {base}/tts, ответ — JSON с base64-аудио.
+    /// Поддерживает голоса (eve, ara, carina, ...) и инлайн speech-теги вида
+    /// [pause] [laugh] [sigh] и <whisper>...</whisper> прямо в тексте.
+    #[instrument(skip_all, fields(chars = text.len()))]
+    async fn synthesize_xai_with_format(
+        &self,
+        text: &str,
+        audio_format: &crate::config::AudioFormat,
+    ) -> anyhow::Result<SynthesizedAudio> {
+        const XAI_API_BASE: &str = "https://api.x.ai/v1";
+
+        let base = self.config.api_url.as_deref().unwrap_or(XAI_API_BASE);
+        let trimmed = base.trim_end_matches('/');
+        let endpoint = if trimmed.ends_with("/tts") {
+            trimmed.to_string()
+        } else {
+            format!("{}/tts", trimmed)
+        };
+
+        let api_key = self
+            .config
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TTS API key not configured"))?;
+
+        let (codec, convert_to_opus) = match audio_format {
+            crate::config::AudioFormat::Opus => ("pcm", true),
+            crate::config::AudioFormat::Mp3 => ("mp3", false),
+        };
+
+        let language = self.config.language.as_deref().unwrap_or("auto");
+        let request_body = serde_json::json!({
+            "text": text,
+            "language": language,
+            "voice_id": self.config.voice,
+            "output_format": {
+                "codec": codec,
+                "sample_rate": 24000,
+            },
+        });
+
+        info!(
+            endpoint = %endpoint,
+            voice = %self.config.voice,
+            language = %language,
+            codec,
+            input_chars = text.len(),
+            "TTS xAI: POST /tts"
+        );
+
+        let started = Instant::now();
+        let response = self
+            .client
+            .post(&endpoint)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .context("Failed to send xAI TTS request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            let trimmed_err = error_text.chars().take(1000).collect::<String>();
+            error!(
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                body_prefix = %trimmed_err,
+                "xAI TTS API error"
+            );
+            anyhow::bail!("xAI TTS API error: {} - {}", status, trimmed_err);
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        // xAI отдаёт сырые байты (audio/pcm, audio/mpeg). JSON с base64 приходит
+        // только в расширенных режимах (например, with_timestamps) — поддерживаем оба.
+        let raw_body = response
+            .bytes()
+            .await
+            .context("Failed to read xAI TTS response")?
+            .to_vec();
+
+        let audio_data = if content_type.starts_with("application/json") {
+            #[derive(serde::Deserialize)]
+            struct XaiTtsResponse {
+                audio: String,
+            }
+            let body: XaiTtsResponse = serde_json::from_slice(&raw_body)
+                .context("Failed to parse xAI TTS response JSON")?;
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(body.audio.as_bytes())
+                .context("Failed to decode base64 audio from xAI TTS")?
+        } else {
+            raw_body
+        };
+
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            audio_bytes = audio_data.len(),
+            content_type = %content_type,
+            convert_to_opus,
+            "TTS xAI: audio received"
+        );
+
+        if convert_to_opus {
+            let pcm_samples = utils::bytes_to_pcm_samples(&audio_data)
+                .context("Failed to convert PCM bytes to samples")?;
+            let mut processor =
+                AudioStreamProcessor::new().context("Failed to create audio processor")?;
+            let opus_frames = processor
+                .encode_to_opus_frames(&pcm_samples)
+                .context("Failed to encode PCM to Opus")?;
+            let total_bytes: usize = opus_frames.iter().map(|f| f.len()).sum();
+            info!(
+                opus_frames = opus_frames.len(),
+                opus_payload_bytes = total_bytes,
+                "TTS xAI: Opus frames ready for client"
+            );
+            Ok(SynthesizedAudio::OpusFrames(opus_frames))
+        } else {
+            Ok(SynthesizedAudio::Binary(audio_data))
         }
     }
 

@@ -166,6 +166,14 @@ pub struct SttConfig {
     /// API ключ для доступа к STT сервису
     /// Получить можно на https://platform.openai.com
     pub api_key: Option<String>,
+    /// Язык распознавания (ISO-639-1, например "ru").
+    /// None = автоопределение языка Whisper'ом.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Контекстная подсказка для Whisper (уменьшает галлюцинации на коротком
+    /// или шумном аудио — выдуманные имена, «Субтитры…» и т.п.)
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// Формат аудио для TTS ответов
@@ -202,10 +210,13 @@ pub struct TtsConfig {
     pub model: String,
     /// Голос для синтеза речи
     /// OpenAI поддерживает: "alloy", "echo", "fable", "onyx", "nova", "shimmer"
-    /// Каждый голос звучит по-разному
+    /// xAI (provider "grok"/"xai") поддерживает: "eve", "ara", "carina" и другие
     pub voice: String,
     /// Формат аудио для ответов (Opus или MP3)
     pub audio_format: AudioFormat,
+    /// Язык синтеза (BCP-47, например "ru"). None = "auto" (для xAI).
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +420,16 @@ impl Config {
         } else {
             tracing::warn!("STT_API_KEY environment variable not found");
         }
+        if let Ok(lang) = std::env::var("STT_LANGUAGE") {
+            if !lang.trim().is_empty() {
+                cfg.stt.language = Some(lang.trim().to_string());
+            }
+        }
+        if let Ok(prompt) = std::env::var("STT_PROMPT") {
+            if !prompt.trim().is_empty() {
+                cfg.stt.prompt = Some(prompt.trim().to_string());
+            }
+        }
 
         // TTS configuration
         if let Ok(provider) = std::env::var("TTS_PROVIDER") {
@@ -433,6 +454,11 @@ impl Config {
                 "mp3" => AudioFormat::Mp3,
                 "opus" | _ => AudioFormat::Opus,
             };
+        }
+        if let Ok(lang) = std::env::var("TTS_LANGUAGE") {
+            if !lang.trim().is_empty() {
+                cfg.tts.language = Some(lang.trim().to_string());
+            }
         }
 
         // Provide sane defaults/fallbacks for STT/OpenAI usage
@@ -541,6 +567,8 @@ impl Default for Config {
                 provider: "whisper".to_string(),
                 api_url: Some(OPENAI_API_BASE.to_string()),
                 api_key: None,
+                language: None,
+                prompt: None,
             },
             tts: TtsConfig {
                 provider: "openai".to_string(),
@@ -549,6 +577,7 @@ impl Default for Config {
                 model: "tts-1".to_string(),
                 voice: "alloy".to_string(),
                 audio_format: AudioFormat::Opus,
+                language: None,
             },
             storage: StorageConfig {
                 base_path: PathBuf::from("./storage"),

@@ -149,7 +149,7 @@ impl SttService {
         let upload_len = audio_file.len();
 
         // Создаем multipart форму для отправки
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::multipart::Form::new()
             .text("model", "whisper-1")
             .part(
                 "file",
@@ -157,6 +157,17 @@ impl SttService {
                     .file_name(file_name)
                     .mime_str(mime_type)?,
             );
+        // Фиксируем язык распознавания (STT_LANGUAGE), иначе Whisper угадывает
+        // язык сам и русская речь может распознаться как другой язык.
+        if let Some(lang) = self.config.language.as_deref() {
+            form = form.text("language", lang.to_string());
+        }
+        // temperature=0 + контекстный prompt: меньше галлюцинаций на коротком
+        // и шумном аудио (случайные имена, «Субтитры сделал…» и прочий мусор).
+        form = form.text("temperature", "0");
+        if let Some(prompt) = self.config.prompt.as_deref() {
+            form = form.text("prompt", prompt.to_string());
+        }
 
         let started = Instant::now();
         let response = self

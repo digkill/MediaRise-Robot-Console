@@ -53,25 +53,35 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
+/// Клиент с разумным таймаутом: без него упавшая сеть/провайдер подвешивает
+/// обработку реплики навсегда, и устройство молчит без ошибки.
+fn default_llm_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 impl LlmService {
     pub fn new(config: &Config) -> anyhow::Result<Self> {
         Ok(Self {
             provider: LlmProvider::from_config(config)?,
-            client: reqwest::Client::new(),
+            client: default_llm_client(),
         })
     }
 
     pub fn new_grok(config: &GrokConfig) -> anyhow::Result<Self> {
         Ok(Self {
             provider: LlmProvider::Grok(config.clone()),
-            client: reqwest::Client::new(),
+            client: default_llm_client(),
         })
     }
 
     pub fn new_openai(config: &OpenAiLlmConfig) -> anyhow::Result<Self> {
         Ok(Self {
             provider: LlmProvider::OpenAi(config.clone()),
-            client: reqwest::Client::new(),
+            client: default_llm_client(),
         })
     }
 
@@ -96,6 +106,123 @@ impl LlmService {
             LlmProvider::Grok(cfg) => self.chat_grok(cfg, messages).await,
             LlmProvider::OpenAi(cfg) => self.chat_openai(cfg, messages).await,
         }
+    }
+
+    /// Стриминговый чат: возвращает канал, в который прилетают дельты текста
+    /// по мере генерации. Позволяет начинать TTS с первого предложения, не
+    /// дожидаясь всего ответа (ключ к «алекса-скорости» диалога).
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<String>> {
+        let (provider_name, api_url, api_key, model, max_tokens, temperature, system_prompt) =
+            match &self.provider {
+                LlmProvider::Grok(cfg) => (
+                    "Grok",
+                    cfg.api_url.clone(),
+                    cfg.api_key.clone(),
+                    cfg.model.clone(),
+                    cfg.max_tokens,
+                    cfg.temperature,
+                    cfg.system_prompt.clone(),
+                ),
+                LlmProvider::OpenAi(cfg) => (
+                    "OpenAI",
+                    cfg.api_url.clone(),
+                    cfg.api_key.clone().unwrap_or_default(),
+                    cfg.model.clone(),
+                    cfg.max_tokens,
+                    cfg.temperature,
+                    cfg.system_prompt.clone(),
+                ),
+            };
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            anyhow::bail!("{provider_name} API key is not configured");
+        }
+
+        let mut payload_messages = Vec::new();
+        if let Some(prompt) = system_prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            payload_messages.push(Message {
+                role: "system".to_string(),
+                content: prompt.to_string(),
+            });
+        }
+        for m in messages {
+            payload_messages.push(Message {
+                role: m.role,
+                content: m.content,
+            });
+        }
+
+        let request = ChatCompletionsRequest {
+            model: model.clone(),
+            messages: payload_messages,
+            max_tokens,
+            temperature,
+            stream: true,
+        };
+        let url = format!("{}/chat/completions", api_url.trim_end_matches('/'));
+        info!(provider = provider_name, %url, request_model = %model, "LLM chat/completions POST (stream)");
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .with_context(|| format!("Failed to send stream request to {provider_name}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "{provider_name} stream API error: {} - {}",
+                status,
+                body.chars().take(500).collect::<String>()
+            );
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut byte_stream = response.bytes_stream();
+            let mut pending = String::new();
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("LLM stream chunk error: {}", e);
+                        break;
+                    }
+                };
+                pending.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = pending.find('\n') {
+                    let line = pending[..pos].trim().to_string();
+                    pending.drain(..=pos);
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data == "[DONE]" {
+                        return;
+                    }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(delta) = value
+                            .pointer("/choices/0/delta/content")
+                            .and_then(|d| d.as_str())
+                        {
+                            if !delta.is_empty() && tx.send(delta.to_string()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(rx)
     }
 
     pub async fn describe_robot_view(&self, jpeg: &[u8]) -> anyhow::Result<String> {

@@ -90,7 +90,9 @@
       "Bash(stty -f /dev/cu.usbmodem1101 115200 raw cs8 -parenb -cstopb)",
       "Bash(touch /Users/digkill/Projects/ESP32/mediarise-robot-console/xiaozhi-esp32/main/boards/waveshare-s3-touch-amoled-2.06/esp32-s3-touch-amoled-2.06.cc)",
       "Bash(idf.py build *)",
-      "Bash(ps -p 41135 -o pid,command)"
+      "Bash(ps -p 41135 -o pid,command)",
+      "Bash(cargo check *)",
+      "Bash(xcodebuild -scheme HomeBot -destination \"generic/platform=iOS\" build)"
     ]
   }
 }
